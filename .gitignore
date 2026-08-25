@@ -1,0 +1,5 @@
+# session-bus has no dependencies and no build step; nothing here should ever be committed.
+node_modules/
+*.tmp
+*.log
+.DS_Store

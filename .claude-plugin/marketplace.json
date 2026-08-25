@@ -1,0 +1,19 @@
+{
+  "name": "session-bus",
+  "owner": {
+    "name": "Hong Zhou",
+    "email": "zh.robot@pku.edu.cn"
+  },
+  "metadata": {
+    "description": "Messaging between local Claude Code sessions",
+    "version": "0.3.1"
+  },
+  "plugins": [
+    {
+      "name": "session-bus",
+      "description": "Send messages between local Claude Code sessions. On machines where channels work it pushes the message straight into the target session, even when that session is idle; elsewhere it falls back to a blocking tool result or end-of-turn hook context. Keyed by session id, so duplicate terminal titles cannot misroute.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

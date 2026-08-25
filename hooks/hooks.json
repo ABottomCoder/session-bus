@@ -1,0 +1,16 @@
+{
+  "description": "session-bus: deliver peer-session messages at end of turn without using the input box",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/stop-pickup.mjs\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
