@@ -20,7 +20,7 @@ whichever fits its current state.*
 ## Quick Start
 
 ```bash
-node test/smoke.mjs                    # 48 checks, needs nothing installed. Run this first.
+node test/smoke.mjs                    # 55 checks, needs nothing installed. Run this first.
 claude plugin validate .               # manifest check
 
 # Iterating on the code: load this directory directly, no install, no cache.
@@ -57,7 +57,7 @@ lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, r
 .mcp.json               Declares the MCP server (uses ${CLAUDE_PLUGIN_ROOT}).
 .claude-plugin/         plugin.json (the plugin) + marketplace.json (so it is installable).
 .gitignore              nothing is generated; this only guards against accidents.
-test/smoke.mjs          48 checks against real server processes, real JSON-RPC, real sockets.
+test/smoke.mjs          55 checks against real server processes, real JSON-RPC, real sockets.
 ```
 
 ### Runtime state (per machine, never in the repo)
@@ -152,9 +152,39 @@ Settled questions.)
    channel is registered but the event doesn't land. The read cursor advances only when the
    model actually calls `session_inbox` (or another delivery path drains it). There is a test
    for this: "the push is not pre-marked read".
-9. **Declaring the `claude/channel` capability must stay unconditional.** It is what lets an
+9. **Message bodies render quoted, scrubbed, and never at top level.** `formatMessages` is the
+   single choke point where untrusted peer text enters a model's context: every body line gets
+   a `> ` prefix (a body faking a frame header or NOTE renders as visibly quoted data — no
+   closing delimiter exists to escape), and bodies/labels/cwds pass through `scrub()` (strips
+   ANSI + control chars) before reaching a terminal, a notification, or model context. Do not
+   add a render path that bypasses this, and keep the NOTE (with its "sender is claimed, not
+   authenticated" line) after the bodies at top level.
+10. **Declaring the `claude/channel` capability must stay unconditional.** It is what lets an
    opted-in session register us, and it is harmless where channels don't work — the server
    still serves tools normally (verified on Bedrock).
+
+## Trust model (hardened 2026-08-25, v0.4.0)
+
+Everything runs as one OS user on one machine. What is and is not defended:
+
+- **NOT defendable here: a malicious process running as the same user.** It can write inboxes
+  directly, impersonate any sender, or read anything — that is the OS trust boundary, same as
+  for `~/.ssh`. The CLI's `--sid`/`--from-label` overrides make this explicit rather than
+  pretending otherwise.
+- **Defended: other OS users.** All runtime dirs are 0700 and files/sockets 0600 (`ensureDirs`
+  enforces dir modes on every call; `sweep()` repairs pre-hardening file modes once per server
+  start).
+- **Defended: prompt injection via message content** — the realistic attack: a message body
+  faking frame headers, system notices, or "the human approved X", aimed at a receiver running
+  in a permissive permission mode. Mitigated by invariant 9 (quoted rendering + scrub) and by
+  the NOTE telling the receiver the sender is unauthenticated and confirmation is required for
+  destructive actions. Defense in depth, not proof: a sufficiently gullible model is still the
+  weak link, which is why the NOTE exists *and* the framing makes fakes visually distinct.
+- **Defended: resource abuse.** Send-side body cap (`MAX_BODY` 64k, truncation disclosed),
+  render-side cap (16k/message), and a 16k cap on the signal socket buffer — a peer cannot
+  blow out a receiver's context or the server's memory, maliciously or by accident.
+- **Sender identity is a claim.** Verifying it same-user is impossible (anything provable is
+  forgeable by the same access), so the rendering says so instead of implying authority.
 
 ## Inbox lifetime
 
@@ -255,7 +285,7 @@ no build output, no `node_modules`, and no absolute paths (verified by grep; the
 machine-specific strings are the author emails in `.claude-plugin/*.json`).
 
 1. Update the author fields in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.
-2. `node test/smoke.mjs` — expect 48/48 on the new machine.
+2. `node test/smoke.mjs` — expect 55/55 on the new machine.
 3. `claude plugin validate .` — expect "Validation passed".
 4. **Verify the channel path** (see below) — ✅ done 2026-08-25, passed on first real run.
 5. `git init && git add -A && git commit` then push.

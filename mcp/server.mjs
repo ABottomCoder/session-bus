@@ -4,7 +4,7 @@
 import {
   identity, register, unregister, listSessions, resolveTarget, send, unread,
   markSeen, notifyHuman, formatMessages, listenForSignals, signal, watchInbox, sweep,
-  channelStatus,
+  channelStatus, scrub,
 } from '../lib/bus.mjs'
 
 const PROTOCOL = '2025-06-18'
@@ -68,7 +68,7 @@ function pushChannel(msgs) {
     params: {
       content: `${formatMessages(msgs)}\n\nCall session_inbox now to acknowledge these message(s); until you do, session-bus treats them as undelivered and will fall back to notifying the human.`,
       meta: {
-        from: String(msgs[0]?.fromLabel || msgs[0]?.from || 'peer').slice(0, 60),
+        from: scrub(msgs[0]?.fromLabel || msgs[0]?.from || 'peer').slice(0, 60),
         count: String(msgs.length),
       },
     },
@@ -80,8 +80,8 @@ async function onIncomingSignal(payload) {
 
   // Nobody is waiting, so the model is idle or mid-turn and we cannot start a turn ourselves
   // (sampling is not supported; elicitation cannot inject context).
-  const from = payload?.fromLabel || payload?.from || 'a peer session'
-  const preview = String(payload?.preview || '').slice(0, 140)
+  const from = scrub(payload?.fromLabel || payload?.from || 'a peer session').slice(0, 80)
+  const preview = scrub(payload?.preview || '').slice(0, 140)
 
   if (CHANNEL.active) {
     const pending = unread(me.sid)
@@ -170,9 +170,11 @@ const TOOLS = [
   },
 ]
 
+// Labels are cleaned on read, but cwd comes straight from a registration file any local
+// process could have written — scrub it before it reaches model context.
 const describe = (list) =>
   list.length
-    ? list.map((s) => `- ${s.label}  [id ${s.sid.slice(0, 12)}]  cwd=${s.cwd}${s.unread ? `  ${s.unread} unread` : ''}`).join('\n')
+    ? list.map((s) => `- ${s.label}  [id ${s.sid.slice(0, 12)}]  cwd=${scrub(s.cwd).slice(0, 200)}${s.unread ? `  ${s.unread} unread` : ''}`).join('\n')
     : '(none — no other live sessions on the bus)'
 
 function deliverUnread() {
@@ -285,7 +287,7 @@ async function handle(req) {
         // silently dropped (verified on Bedrock).
         experimental: { 'claude/channel': {} },
       },
-      serverInfo: { name: 'session-bus', version: '0.3.1' },
+      serverInfo: { name: 'session-bus', version: '0.4.0' },
       instructions: INSTRUCTIONS,
     })
   }

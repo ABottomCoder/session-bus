@@ -114,6 +114,22 @@ sessions are listed or a target is resolved, so a session renamed with `/rename`
 by its new name immediately. A label set explicitly via `SESSION_BUS_LABEL` is pinned and
 never overridden.
 
+## Security
+
+The bus never leaves your machine, and everything in `~/.claude/session-bus/` is created
+`0700`/`0600` — other users on the machine can't read your messages or poke your sockets.
+
+Messages from peer sessions are treated as **untrusted data**: every body line is rendered
+quoted (`> `), stripped of ANSI/control characters, and followed by a notice telling the
+receiving model that the sender identity is claimed rather than authenticated and that
+destructive or outward-facing actions still need your confirmation. A message that tries to
+fake a system notice or your approval renders as visibly quoted text. Bodies are also capped
+(64k stored / 16k rendered) so a peer can't blow out a session's context.
+
+The honest limit: anything running **as your own user** can write to the bus and claim any
+sender name — the same boundary as `~/.ssh`. Session-bus makes that visible instead of
+pretending to authenticate peers.
+
 ## Config
 
 | Env var | Effect |
@@ -186,7 +202,7 @@ restart the session.
 ## Development
 
 ```bash
-node test/smoke.mjs          # 48 checks against real servers, real JSON-RPC, real sockets
+node test/smoke.mjs          # 55 checks against real servers, real JSON-RPC, real sockets
 claude plugin validate .     # manifest check
 claude --plugin-dir "$PWD"   # load into one session only, without a global install
 ```
@@ -201,5 +217,5 @@ lib/bus.mjs             identity, inbox, socket signalling, sweep, rendering
 mcp/server.mjs          MCP server: 4 tools, socket listener, no polling
 hooks/stop-pickup.mjs   Stop hook: end-of-turn delivery, fail-open
 bin/bus.mjs             CLI: list / send / inbox / whoami / sweep
-test/smoke.mjs          48-check smoke suite
+test/smoke.mjs          55-check smoke suite
 ```
