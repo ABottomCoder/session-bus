@@ -22,7 +22,7 @@ whichever fits its current state.*
 ```bash
 node test/smoke.mjs                    # L1: 55 functional checks. Run this first.
 node test/stress.mjs                   # L2: 14 concurrency/race checks (multi-process)
-node test/chaos.mjs                    # L3: 17 fault-injection checks
+node test/chaos.mjs                    # L3: 25 fault-injection checks
 claude plugin validate .               # manifest check
 
 # Iterating on the code: load this directory directly, no install, no cache.
@@ -61,7 +61,7 @@ lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, r
 .gitignore              nothing is generated; this only guards against accidents.
 test/smoke.mjs          L1: 55 checks against real server processes, real JSON-RPC, real sockets.
 test/stress.mjs         L2: 14 concurrency/race checks — real multi-process interleavings.
-test/chaos.mjs          L3: 17 fault-injection checks — corruption, floods, kills, garbage.
+test/chaos.mjs          L3: 25 fault-injection checks — corruption, floods, kills, garbage.
 ```
 
 ### Test campaign record (2026-08-25, v0.5.0, production-playbook L1–L5)
@@ -70,7 +70,7 @@ test/chaos.mjs          L3: 17 fault-injection checks — corruption, floods, ki
 |---|---|---|
 | L1 business | smoke.mjs 55 checks | ✅ 55/55 |
 | L2 concurrency | stress.mjs 14 checks; found+fixed cursor RMW race (96/200 lost) and 500-id seen-cap resurrection | ✅ 14/14 after fix |
-| L3 fault/chaos | chaos.mjs 17 checks; found+fixed newline-fusion append loss; SIGKILL recovery, floods, corruption all clean | ✅ 17/17 after fix |
+| L3 fault/chaos | chaos.mjs 25 checks; found+fixed newline-fusion append loss; flood batching + alert coalescing added after v0.5 review; SIGKILL recovery, floods, corruption all clean | ✅ 25/25 after fix |
 | L4 security | semgrep OSS important-only (p/javascript+nodejs+trailofbits+secrets): 0 findings; gitleaks full history: 0 leaks; zero deps → no CVE surface; hardening suite in smoke [13] | ✅ |
 | L5 observability | sessions_list reports true mode+reason (desktop, no channels); dead-socket send discloses WARNING + storage; live E2E: new sender × old cached receiver over channel path, autonomous ack in ~1s | ✅ |
 
@@ -208,6 +208,11 @@ Everything runs as one OS user on one machine. What is and is not defended:
 - **Defended: resource abuse.** Send-side body cap (`MAX_BODY` 64k, truncation disclosed),
   render-side cap (16k/message), and a 16k cap on the signal socket buffer — a peer cannot
   blow out a receiver's context or the server's memory, maliciously or by accident.
+  Delivery is also **batched** (`deliveryBatch`: ≤50 messages / ≤48k chars per delivery,
+  overflow stays unread and is disclosed) so a flooded inbox cannot be injected into the
+  receiver's context in one turn, and **notifications are coalesced** (`makeAlertGate`:
+  alert on empty→non-empty, then at most once per `SESSION_BUS_ALERT_COOLDOWN_MS`) so a
+  looping sender cannot flood the notification center.
 - **Sender identity is a claim.** Verifying it same-user is impossible (anything provable is
   forgeable by the same access), so the rendering says so instead of implying authority.
 
@@ -289,6 +294,7 @@ loosening the regex.
 | `SESSION_BUS_FORCE_CHANNEL=1` | Treat channels as available regardless of detection |
 | `SESSION_BUS_NO_CHANNEL=1` | Never use the channel path |
 | `SESSION_BUS_CHANNEL_VERIFY_MS` | Push verification window, default 25000 |
+| `SESSION_BUS_ALERT_COOLDOWN_MS` | Notification re-alert cooldown while unread mail keeps arriving, default 300000 |
 | `SESSION_BUS_SID` / `SESSION_BUS_PID` | Test-only identity overrides |
 
 ## Platform notes
@@ -311,7 +317,7 @@ machine-specific strings are the author emails in `.claude-plugin/*.json`).
 
 1. Update the author fields in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.
 2. `node test/smoke.mjs && node test/stress.mjs && node test/chaos.mjs` — expect 55/55,
-   14/14, 17/17 on the new machine (verified 2026-08-25 on macOS / Node 18.20.8).
+   14/14, 25/25 on the new machine (verified 2026-08-25 on macOS / Node 18.20.8).
 3. `claude plugin validate .` — expect "Validation passed".
 4. **Verify the channel path** (see below) — ✅ done 2026-08-25, passed on first real run.
 5. `git init && git add -A && git commit` then push.

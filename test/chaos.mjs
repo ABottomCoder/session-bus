@@ -177,6 +177,40 @@ console.log('\n[C7] hostile message fields: bad ts, missing fields, null body â€
   check('formatMessages survives hostile field values', typeof out === 'string' && out.includes('bad ts'), String(out).slice(0, 100))
 }
 
+console.log('\n[C8] inbox flood: delivery is batched, overflow stays unread and is disclosed')
+{
+  const { deliveryBatch } = await import('../lib/bus.mjs')
+  const sid = sidOf('flood')
+  for (let i = 0; i < 120; i++) send({ toSid: sid, from: 'flooder', body: `flood-${i}` })
+  const out = await new Promise((res) => {
+    const h = spawn('node', [HOOK], { stdio: ['pipe', 'pipe', 'pipe'] })
+    let o = ''
+    h.stdout.on('data', (d) => { o += d })
+    h.on('exit', () => res(o))
+    h.stdin.write(JSON.stringify({ session_id: sid })); h.stdin.end()
+  })
+  const remaining = unread(sid).length
+  check('hook delivers a bounded batch (50), not the whole flood', remaining === 70, `remaining=${remaining}`)
+  check('overflow is disclosed in the delivery', /70 more unread/.test(out), out.slice(-200))
+  check('hook summary flags the queue', /\+70 queued/.test(out), out.slice(0, 200))
+  // A giant-body flood must be bounded by chars, not just count.
+  const big = Array.from({ length: 20 }, (_, i) => ({ id: `b${i}`, body: 'x'.repeat(10_000) }))
+  const { batch, more } = deliveryBatch(big)
+  check('char cap kicks in before count cap on huge bodies', batch.length < 20 && more > 0 && batch.length >= 1,
+    `batch=${batch.length} more=${more}`)
+}
+
+console.log('\n[C9] notification gate: emptyâ†’non-empty alerts, floods stay quiet, cooldown re-alerts')
+{
+  const { makeAlertGate } = await import('../lib/bus.mjs')
+  const gate = makeAlertGate({ cooldownMs: 10_000 })
+  const t = 1_000_000
+  check('first message into empty inbox alerts', gate(1, t) === true)
+  check('pile-up within cooldown stays silent', gate(2, t + 1000) === false && gate(50, t + 2000) === false)
+  check('cooldown elapsed with mail still arriving re-alerts once', gate(51, t + 12_000) === true && gate(52, t + 13_000) === false)
+  check('drained-then-new-message alerts immediately', gate(1, t + 14_000) === true)
+}
+
 // ---- cleanup
 for (const sid of cleanup) {
   for (const [dir, ext] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sock', '.sock'], ['sessions', '.json']]) {

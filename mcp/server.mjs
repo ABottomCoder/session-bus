@@ -4,7 +4,7 @@
 import {
   identity, register, unregister, listSessions, resolveTarget, send, unread,
   markSeen, notifyHuman, formatMessages, listenForSignals, signal, watchInbox, sweep,
-  channelStatus, scrub, compactCursor,
+  channelStatus, scrub, compactCursor, deliveryBatch, makeAlertGate,
 } from '../lib/bus.mjs'
 
 const PROTOCOL = '2025-06-18'
@@ -54,7 +54,14 @@ const CHANNEL_VERIFY_MS = Number(process.env.SESSION_BUS_CHANNEL_VERIFY_MS) || 2
 
 const CHANNEL = channelStatus({ pid: me.pid })
 
-function alertHuman(from, preview) {
+// Coalesced: alerts on empty→non-empty, then at most once per cooldown while unread mail
+// keeps arriving — a looping sender cannot flood the notification center.
+const shouldAlert = makeAlertGate({
+  cooldownMs: Number(process.env.SESSION_BUS_ALERT_COOLDOWN_MS) || 300_000,
+})
+
+function alertHuman(from, preview, unreadCount) {
+  if (!shouldAlert(unreadCount)) return
   notifyHuman({
     title: `session-bus → ${me.label}`,
     text: `from ${from}: ${preview}`,
@@ -64,12 +71,12 @@ function alertHuman(from, preview) {
 
 // Preferred path when channels work: push the message straight into the running session.
 // This is the only mechanism that reaches a session sitting idle at its prompt.
-function pushChannel(msgs) {
+function pushChannel(msgs, more) {
   write({
     jsonrpc: '2.0',
     method: 'notifications/claude/channel',
     params: {
-      content: `${formatMessages(msgs)}\n\nCall session_inbox now to acknowledge these message(s); until you do, session-bus treats them as undelivered and will fall back to notifying the human.`,
+      content: `${formatMessages(msgs, { more })}\n\nCall session_inbox now to acknowledge these message(s); until you do, session-bus treats them as undelivered and will fall back to notifying the human.`,
       meta: {
         from: scrub(msgs[0]?.fromLabel || msgs[0]?.from || 'peer').slice(0, 60),
         count: String(msgs.length),
@@ -89,19 +96,20 @@ async function onIncomingSignal(payload) {
   if (CHANNEL.active) {
     const pending = unread(me.sid)
     if (pending.length) {
-      pushChannel(pending)
-      const ids = new Set(pending.map((m) => m.id))
+      const { batch, more } = deliveryBatch(pending)
+      pushChannel(batch, more)
+      const ids = new Set(batch.map((m) => m.id))
       // Verify: if the model never acknowledged, the push was dropped (or ignored) and the
       // human still needs to know. Only alert about messages that are still unread.
       setTimeout(() => {
         const stillUnread = unread(me.sid).filter((m) => ids.has(m.id))
-        if (stillUnread.length) alertHuman(from, preview)
+        if (stillUnread.length) alertHuman(from, preview, stillUnread.length)
       }, CHANNEL_VERIFY_MS).unref?.()
       return
     }
   }
 
-  alertHuman(from, preview)
+  alertHuman(from, preview, unread(me.sid).length)
 
   if (process.env.SESSION_BUS_ELICIT === '1' && clientCaps.elicitation) {
     await request('elicitation/create', {
@@ -183,8 +191,11 @@ const describe = (list) =>
 function deliverUnread() {
   const msgs = unread(me.sid)
   if (!msgs.length) return null
-  markSeen(me.sid, msgs.map((m) => m.id))
-  return formatMessages(msgs)
+  // Batched: only what is delivered is marked seen; the rest stays unread and the render
+  // tells the model to call session_inbox again.
+  const { batch, more } = deliveryBatch(msgs)
+  markSeen(me.sid, batch.map((m) => m.id))
+  return formatMessages(batch, { more })
 }
 
 async function callTool(name, args = {}) {
@@ -290,7 +301,7 @@ async function handle(req) {
         // silently dropped (verified on Bedrock).
         experimental: { 'claude/channel': {} },
       },
-      serverInfo: { name: 'session-bus', version: '0.5.3' },
+      serverInfo: { name: 'session-bus', version: '0.6.0' },
       instructions: INSTRUCTIONS,
     })
   }

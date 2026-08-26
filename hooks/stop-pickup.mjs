@@ -6,7 +6,7 @@
 //
 // Prefers the session id from the hook's own stdin payload, falling back to env/process
 // resolution, so it keys the same inbox the MCP server does.
-import { identity, unread, markSeen, formatMessages } from '../lib/bus.mjs'
+import { identity, unread, markSeen, formatMessages, deliveryBatch } from '../lib/bus.mjs'
 
 const bail = () => process.exit(0)
 const watchdog = setTimeout(bail, 5000)
@@ -23,16 +23,20 @@ try {
   try { sid = JSON.parse(stdin || '{}').session_id || null } catch {}
   if (!sid) sid = identity().sid
 
-  const msgs = unread(sid)
-  if (!msgs.length) bail()
+  const all = unread(sid)
+  if (!all.length) bail()
+
+  // Batched: a flooded inbox must not be injected into the session's context in one go.
+  // Undelivered messages stay unread; the next Stop (or an inbox call) takes the next batch.
+  const { batch, more } = deliveryBatch(all)
 
   // Advance the cursor BEFORE blocking, or the same messages re-inject on every Stop
-  // and the session never comes to rest.
-  markSeen(sid, msgs.map((m) => m.id))
+  // and the session never comes to rest. Only the delivered batch is marked.
+  markSeen(sid, batch.map((m) => m.id))
 
-  const body = formatMessages(msgs)
-  const senders = [...new Set(msgs.map((m) => m.fromLabel || m.from))].join(', ')
-  const summary = `session-bus: ${msgs.length} new message(s) from ${senders}`
+  const body = formatMessages(batch, { more })
+  const senders = [...new Set(batch.map((m) => m.fromLabel || m.from))].join(', ')
+  const summary = `session-bus: ${batch.length} new message(s) from ${senders}${more ? ` (+${more} queued)` : ''}`
 
   process.stdout.write(JSON.stringify({
     decision: 'block',

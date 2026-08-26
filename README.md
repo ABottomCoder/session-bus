@@ -111,6 +111,12 @@ destructive.
 
 There is **no polling anywhere** in the delivery path.
 
+Two politeness guarantees on top: **notifications are coalesced** — you get one when mail
+first arrives in an empty inbox, silence while it piles up, and at most one reminder per
+5 minutes (configurable) — and **delivery is batched** (50 messages / 48k chars at a time,
+the rest disclosed and kept unread), so a flood can neither spam your notification center
+nor dump an entire backlog into a session's context at once.
+
 ### Channels: the best case, when you can get it
 
 If a session is started with `--channels`, session-bus pushes messages **straight into it even
@@ -193,6 +199,7 @@ pretending to authenticate peers.
 | `SESSION_BUS_FORCE_CHANNEL=1` | Use the channel path even if detection says it's unavailable |
 | `SESSION_BUS_NO_CHANNEL=1` | Never use the channel path |
 | `SESSION_BUS_CHANNEL_VERIFY_MS` | How long to wait for a push to be picked up before notifying you (default 25000) |
+| `SESSION_BUS_ALERT_COOLDOWN_MS` | How often at most to re-notify while unread messages keep arriving (default 300000 = 5 min) |
 
 ## Turning it off
 
