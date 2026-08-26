@@ -20,7 +20,9 @@ whichever fits its current state.*
 ## Quick Start
 
 ```bash
-node test/smoke.mjs                    # 55 checks, needs nothing installed. Run this first.
+node test/smoke.mjs                    # L1: 55 functional checks. Run this first.
+node test/stress.mjs                   # L2: 12 concurrency/race checks (multi-process)
+node test/chaos.mjs                    # L3: 17 fault-injection checks
 claude plugin validate .               # manifest check
 
 # Iterating on the code: load this directory directly, no install, no cache.
@@ -57,8 +59,22 @@ lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, r
 .mcp.json               Declares the MCP server (uses ${CLAUDE_PLUGIN_ROOT}).
 .claude-plugin/         plugin.json (the plugin) + marketplace.json (so it is installable).
 .gitignore              nothing is generated; this only guards against accidents.
-test/smoke.mjs          55 checks against real server processes, real JSON-RPC, real sockets.
+test/smoke.mjs          L1: 55 checks against real server processes, real JSON-RPC, real sockets.
+test/stress.mjs         L2: 12 concurrency/race checks — real multi-process interleavings.
+test/chaos.mjs          L3: 17 fault-injection checks — corruption, floods, kills, garbage.
 ```
+
+### Test campaign record (2026-08-25, v0.5.0, production-playbook L1–L5)
+
+| Layer | Evidence | Result |
+|---|---|---|
+| L1 business | smoke.mjs 55 checks | ✅ 55/55 |
+| L2 concurrency | stress.mjs 12 checks; found+fixed cursor RMW race (96/200 lost) and 500-id seen-cap resurrection | ✅ 12/12 after fix |
+| L3 fault/chaos | chaos.mjs 17 checks; found+fixed newline-fusion append loss; SIGKILL recovery, floods, corruption all clean | ✅ 17/17 after fix |
+| L4 security | semgrep OSS important-only (p/javascript+nodejs+trailofbits+secrets): 0 findings; gitleaks full history: 0 leaks; zero deps → no CVE surface; hardening suite in smoke [13] | ✅ |
+| L5 observability | sessions_list reports true mode+reason (desktop, no channels); dead-socket send discloses WARNING + storage; live E2E: new sender × old cached receiver over channel path, autonomous ack in ~1s | ✅ |
+
+Node floor: everything above ran on Node v18.20.8 — the declared minimum is the tested version.
 
 ### Runtime state (per machine, never in the repo)
 
@@ -66,7 +82,8 @@ test/smoke.mjs          55 checks against real server processes, real JSON-RPC, 
 ~/.claude/session-bus/
   sessions/<sid>.json     one file per live session — NOT one shared registry (see Invariants)
   msgs/<sid>.jsonl        the inbox, append-only, one JSON object per line
-  cursors/<sid>.json      { seen: [messageId, ...] } — how far this session has read
+  cursors/<sid>.json      APPEND-ONLY lines of {"seen":[ids]} — how far this session has read.
+                          Unioned on read; compacted only at that session's own server start.
   sock/<sid>.sock         the delivery signal socket, owned by that session's server
 ```
 
@@ -159,7 +176,15 @@ Settled questions.)
    ANSI + control chars) before reaching a terminal, a notification, or model context. Do not
    add a render path that bypasses this, and keep the NOTE (with its "sender is claimed, not
    authenticated" line) after the bodies at top level.
-10. **Declaring the `claude/channel` capability must stay unconditional.** It is what lets an
+10. **The read cursor is append-only — never reintroduce read-modify-write on it.** The MCP
+   server (draining a channel ack), the Stop hook, and the CLI can all mark messages seen
+   concurrently; a read-modify-write cursor lost updates and re-delivered those messages
+   (measured worst case 96/200, test/stress.mjs [S2]). Each markSeen appends one atomic
+   `{"seen":[ids]}` line (with a leading newline so a truncated last line can never swallow
+   it — chaos [C2]); reads union all lines; compaction runs only in the session's OWN server
+   at start. There is deliberately no cap on the seen set: a 500-id cap resurrected old
+   messages once the inbox outgrew it (stress [S3]).
+11. **Declaring the `claude/channel` capability must stay unconditional.** It is what lets an
    opted-in session register us, and it is harmless where channels don't work — the server
    still serves tools normally (verified on Bedrock).
 
@@ -285,7 +310,8 @@ no build output, no `node_modules`, and no absolute paths (verified by grep; the
 machine-specific strings are the author emails in `.claude-plugin/*.json`).
 
 1. Update the author fields in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.
-2. `node test/smoke.mjs` — expect 55/55 on the new machine.
+2. `node test/smoke.mjs && node test/stress.mjs && node test/chaos.mjs` — expect 55/55,
+   12/12, 17/17 on the new machine (verified 2026-08-25 on macOS / Node 18.20.8).
 3. `claude plugin validate .` — expect "Validation passed".
 4. **Verify the channel path** (see below) — ✅ done 2026-08-25, passed on first real run.
 5. `git init && git add -A && git commit` then push.
