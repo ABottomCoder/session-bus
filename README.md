@@ -19,16 +19,35 @@ you ──▶ session A ──session_send──▶ [inbox keyed by session id] 
 
 ## Install
 
+**Step 1 — install the plugin** (once per machine):
+
 ```bash
-claude plugin marketplace add <repo-url>
+claude plugin marketplace add ABottomCoder/session-bus
 claude plugin install session-bus@session-bus
 ```
 
-Then **restart** each session you want on the bus (MCP servers only attach at session start —
-`claude --resume` is fine and keeps the session's identity and inbox).
+**Step 2 — restart every session you want on the bus.** This is not optional: MCP servers
+only attach when a session starts, so sessions that are already running will not see the
+bus until restarted. `claude --resume` is fine — it keeps the session's identity, history,
+and inbox.
+
+**Step 3 (recommended) — start receiver sessions with channels** for the best experience:
+
+```bash
+claude --dangerously-load-development-channels plugin:session-bus@session-bus
+```
+
+With this flag, messages are pushed **straight into the session even while it sits idle** —
+nothing to type, nothing to notice. Without it everything still works, but an idle session
+falls back to a macOS notification + bell, and the message lands only after you say
+anything to it. The flag is per-launch (`--resume` does not restore it), it requires the
+`--dangerously-load-development-channels` form because channels are a research-preview
+feature, and it cannot be used from the desktop app — see
+[Channels](#channels-the-best-case-when-you-can-get-it) for the details and caveats.
 
 Requirements: **Node 18+**. That's it — zero dependencies, no `npm install`, no build, no
-launch flags, no admin or org configuration.
+admin or org configuration. The core bus needs no launch flags; the flag above only
+upgrades idle delivery.
 
 ## Using it
 
@@ -76,6 +95,11 @@ It is not always available:
   so each session has to opt in every time it starts.
 - **Research preview**: custom channels are off Anthropic's allowlist, so you need
   `--dangerously-load-development-channels`, or an admin setting `allowedChannelPlugins`.
+- **Desktop app sessions can't opt in**: the desktop app launches sessions with its own
+  fixed arguments and offers no way to add CLI flags (verified against the launch args, and
+  the official docs' only recipe is "restart from a terminal with the flag"). Desktop
+  sessions still send and receive normally — they just use the notification fallback when
+  idle.
 
 To try it:
 
