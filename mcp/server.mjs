@@ -287,7 +287,7 @@ async function handle(req) {
         // silently dropped (verified on Bedrock).
         experimental: { 'claude/channel': {} },
       },
-      serverInfo: { name: 'session-bus', version: '0.4.0' },
+      serverInfo: { name: 'session-bus', version: '0.4.1' },
       instructions: INSTRUCTIONS,
     })
   }
