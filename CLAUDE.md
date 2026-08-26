@@ -105,10 +105,13 @@ landed. Two mechanisms compensate:
 `sessions_list` reports which mode the session is in and why, so a surprising outcome is
 diagnosable rather than mysterious.
 
-**Status: the channel path is unit-tested but has never run on a channel-enabled machine.**
-It could not be tested where it was written (Bedrock). Treat the first real run as unproven:
-check that `sessions_list` reports `channel push`, then send to an idle session and confirm it
-reacts without any typing.
+**Status: VERIFIED on a channel-capable machine (macOS, claude.ai auth, 2026-08-25).**
+Receiver launched with `claude --dangerously-load-development-channels
+plugin:session-bus@session-bus`; `sessions_list` reported `channel push`. A CLI send to the
+idle receiver woke it with nothing typed into it: it reported the message and called
+`session_inbox` on its own, and the read cursor on disk confirmed the message id as seen.
+(The original implementation machine was Bedrock, where channels are unavailable — see
+Settled questions.)
 
 ## Settled questions — do NOT re-litigate without new evidence
 
@@ -244,14 +247,14 @@ machine-specific strings are the author emails in `.claude-plugin/*.json`).
 1. Update the author fields in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.
 2. `node test/smoke.mjs` — expect 45/45 on the new machine.
 3. `claude plugin validate .` — expect "Validation passed".
-4. **Verify the channel path** (see below) — this is the one thing that could not be tested
-   where the code was written.
+4. **Verify the channel path** (see below) — ✅ done 2026-08-25, passed on first real run.
 5. `git init && git add -A && git commit` then push.
 6. Verify a real consumer install from the pushed URL:
    `claude plugin marketplace add <url> && claude plugin install session-bus@session-bus`,
    restart a session, and confirm `sessions_list` reports it.
-   **Unverified:** whether `marketplace add` can authenticate against a GitHub Enterprise host.
-   Test this before telling colleagues it works.
+   ✅ Verified 2026-08-25 against https://github.com/ABottomCoder/session-bus (github.com).
+   **Still unverified:** whether `marketplace add` can authenticate against a GitHub
+   Enterprise host. Test this before telling colleagues it works.
 
 ### Verifying the channel path on a channel-capable machine
 
