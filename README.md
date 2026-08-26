@@ -49,6 +49,35 @@ Requirements: **Node 18+**. That's it — zero dependencies, no `npm install`, n
 admin or org configuration. The core bus needs no launch flags; the flag above only
 upgrades idle delivery.
 
+### Making Step 3 short
+
+That command is long because channels are a research preview: there is no env var and no
+user-level settings.json equivalent for the flag (confirmed against the official settings
+and CLI references — the only channel settings are org-managed). The supported shortening
+is your shell. Add either (or both) to `~/.zshrc` / `~/.bashrc`:
+
+```bash
+# a short explicit command: `claude-bus`
+alias claude-bus='claude --dangerously-load-development-channels plugin:session-bus@session-bus'
+
+# OR: make bare `claude` (and resume) default to channel push.
+# Only session-starting invocations are wrapped; `claude plugin ...`, `claude -p ...`
+# and every other subcommand pass through untouched.
+claude() {
+  case "$1" in
+    ''|-r|--resume|-c|--continue)
+      command claude --dangerously-load-development-channels plugin:session-bus@session-bus "$@" ;;
+    *)
+      command claude "$@" ;;
+  esac
+}
+```
+
+Two caveats: the research-preview warning screen still appears on each launch that carries
+the flag (acceptance is not documented as remembered), and the wrapper deliberately skips
+invocations like `claude --model ...` — start those sessions with `claude-bus --model ...`
+if you want channels there too. Delete the lines to revert.
+
 ## Using it
 
 Four tools, but you shouldn't need to name them — just talk:

@@ -1,6 +1,6 @@
 {
   "name": "session-bus",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Send messages between local Claude Code sessions. Prefers pushing straight into the target session as a channel event; falls back to MCP tool results and end-of-turn hook context where channels are unavailable. Never uses the input box.",
   "author": {
     "name": "Hong Zhou",
