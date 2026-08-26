@@ -319,8 +319,9 @@ machine-specific strings are the author emails in `.claude-plugin/*.json`).
    `claude plugin marketplace add <url> && claude plugin install session-bus@session-bus`,
    restart a session, and confirm `sessions_list` reports it.
    ✅ Verified 2026-08-25 against https://github.com/ABottomCoder/session-bus (github.com).
-   **Still unverified:** whether `marketplace add` can authenticate against a GitHub
-   Enterprise host. Test this before telling colleagues it works.
+   Public github.com distribution is fully verified — this is the path for individual users.
+   (Only relevant if a company wants to mirror this internally: whether `marketplace add`
+   can authenticate against a GitHub Enterprise host is untested. N/A for public release.)
 
 ### Verifying the channel path on a channel-capable machine
 
