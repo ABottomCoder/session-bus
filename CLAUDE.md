@@ -21,7 +21,7 @@ whichever fits its current state.*
 
 ```bash
 node test/smoke.mjs                    # L1: 55 functional checks. Run this first.
-node test/stress.mjs                   # L2: 12 concurrency/race checks (multi-process)
+node test/stress.mjs                   # L2: 14 concurrency/race checks (multi-process)
 node test/chaos.mjs                    # L3: 17 fault-injection checks
 claude plugin validate .               # manifest check
 
@@ -60,7 +60,7 @@ lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, r
 .claude-plugin/         plugin.json (the plugin) + marketplace.json (so it is installable).
 .gitignore              nothing is generated; this only guards against accidents.
 test/smoke.mjs          L1: 55 checks against real server processes, real JSON-RPC, real sockets.
-test/stress.mjs         L2: 12 concurrency/race checks — real multi-process interleavings.
+test/stress.mjs         L2: 14 concurrency/race checks — real multi-process interleavings.
 test/chaos.mjs          L3: 17 fault-injection checks — corruption, floods, kills, garbage.
 ```
 
@@ -69,7 +69,7 @@ test/chaos.mjs          L3: 17 fault-injection checks — corruption, floods, ki
 | Layer | Evidence | Result |
 |---|---|---|
 | L1 business | smoke.mjs 55 checks | ✅ 55/55 |
-| L2 concurrency | stress.mjs 12 checks; found+fixed cursor RMW race (96/200 lost) and 500-id seen-cap resurrection | ✅ 12/12 after fix |
+| L2 concurrency | stress.mjs 14 checks; found+fixed cursor RMW race (96/200 lost) and 500-id seen-cap resurrection | ✅ 14/14 after fix |
 | L3 fault/chaos | chaos.mjs 17 checks; found+fixed newline-fusion append loss; SIGKILL recovery, floods, corruption all clean | ✅ 17/17 after fix |
 | L4 security | semgrep OSS important-only (p/javascript+nodejs+trailofbits+secrets): 0 findings; gitleaks full history: 0 leaks; zero deps → no CVE surface; hardening suite in smoke [13] | ✅ |
 | L5 observability | sessions_list reports true mode+reason (desktop, no channels); dead-socket send discloses WARNING + storage; live E2E: new sender × old cached receiver over channel path, autonomous ack in ~1s | ✅ |
@@ -311,7 +311,7 @@ machine-specific strings are the author emails in `.claude-plugin/*.json`).
 
 1. Update the author fields in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.
 2. `node test/smoke.mjs && node test/stress.mjs && node test/chaos.mjs` — expect 55/55,
-   12/12, 17/17 on the new machine (verified 2026-08-25 on macOS / Node 18.20.8).
+   14/14, 17/17 on the new machine (verified 2026-08-25 on macOS / Node 18.20.8).
 3. `claude plugin validate .` — expect "Validation passed".
 4. **Verify the channel path** (see below) — ✅ done 2026-08-25, passed on first real run.
 5. `git init && git add -A && git commit` then push.

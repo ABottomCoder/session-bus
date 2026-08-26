@@ -21,6 +21,18 @@ const check = (name, cond, detail = '') => {
 const cleanup = []
 const sidOf = (name) => { const s = `sid-${name}-${RUN}`; cleanup.push(s); return s }
 
+// Child helper that surfaces failures: a worker that dies (EAGAIN, OOM, syntax) would
+// otherwise masquerade as a race/lost-update failure in the parent's assertions.
+const runChild = (args) => new Promise((res) => {
+  const c = spawn('node', args, { stdio: ['ignore', 'ignore', 'pipe'] })
+  let err = ''
+  c.stderr.on('data', (d) => { err += d })
+  c.on('exit', (code) => res({ code, err: err.slice(0, 200) }))
+  c.on('error', (e) => res({ code: -1, err: String(e) }))
+})
+const allZero = (rs) => rs.every((r) => r.code === 0)
+const childErrs = (rs) => rs.filter((r) => r.code !== 0).map((r) => `code=${r.code} ${r.err}`).join(' | ')
+
 console.log('\n[S1] concurrent multi-process appends: no lost or corrupted messages')
 {
   const sid = sidOf('append')
@@ -30,9 +42,9 @@ console.log('\n[S1] concurrent multi-process appends: no lost or corrupted messa
     const [sid, w, n] = process.argv.slice(1)
     for (let i = 0; i < Number(n); i++) send({ toSid: sid, from: 'w' + w, body: \`w\${w}-m\${i}\` })
   `
-  const procs = Array.from({ length: WRITERS }, (_, w) =>
-    new Promise((res) => spawn('node', ['--input-type=module', '-e', script, sid, String(w), String(EACH)]).on('exit', res)))
-  await Promise.all(procs)
+  const rs = await Promise.all(Array.from({ length: WRITERS }, (_, w) =>
+    runChild(['--input-type=module', '-e', script, sid, String(w), String(EACH)])))
+  check('all writer processes exited 0', allZero(rs), childErrs(rs))
   const msgs = readInbox(sid)
   const bodies = new Set(msgs.map((m) => m.body))
   const ids = new Set(msgs.map((m) => m.id))
@@ -56,9 +68,9 @@ console.log('\n[S2] concurrent markSeen from two processes (server + Stop hook c
       const [sid, idsJson] = process.argv.slice(1)
       for (const id of JSON.parse(idsJson)) markSeen(sid, [id])
     `
-    const ps = [0, 1].map((k) =>
-      new Promise((res) => spawn('node', ['--input-type=module', '-e', script, sid, half(k)]).on('exit', res)))
-    await Promise.all(ps)
+    const rs = await Promise.all([0, 1].map((k) =>
+      runChild(['--input-type=module', '-e', script, sid, half(k)])))
+    if (!allZero(rs)) { check(`round ${round}: marker child failed (NOT a race)`, false, childErrs(rs)); continue }
     const lost = unread(sid).length
     worstLost = Math.max(worstLost, lost)
   }
@@ -82,11 +94,12 @@ console.log('\n[S4] 10 simultaneous registrations: per-file registry loses nobod
 {
   const holders = Array.from({ length: 10 }, () => spawn('sleep', ['30']))
   const sids = holders.map((h, i) => { const s = sidOf(`reg${i}`); return { sid: s, pid: h.pid } })
-  await Promise.all(sids.map((m) =>
-    new Promise((res) => spawn('node', ['--input-type=module', '-e',
+  const rs = await Promise.all(sids.map((m) =>
+    runChild(['--input-type=module', '-e',
       `import { register } from '${join(HERE, '..', 'lib', 'bus.mjs')}'
        register({ sid: process.argv[1], label: 'r', pid: Number(process.argv[2]), tty: null, cwd: '/tmp' })`,
-      m.sid, String(m.pid)]).on('exit', res))))
+      m.sid, String(m.pid)])))
+  check('all register processes exited 0', allZero(rs), childErrs(rs))
   const live = new Set(listSessions().map((s) => s.sid))
   const missing = sids.filter((m) => !live.has(m.sid))
   check('all 10 concurrent registrations visible', missing.length === 0, `missing ${missing.length}`)
