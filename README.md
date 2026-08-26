@@ -109,6 +109,11 @@ session id, not the title. If you say "send it to review" and two sessions match
 **refused** and you're asked which one you meant — it will not guess. You can always address a
 session by its id, which `sessions_list` shows.
 
+Renames are picked up live: labels are re-read from the current terminal titles every time
+sessions are listed or a target is resolved, so a session renamed with `/rename` is reachable
+by its new name immediately. A label set explicitly via `SESSION_BUS_LABEL` is pinned and
+never overridden.
+
 ## Config
 
 | Env var | Effect |
@@ -181,7 +186,7 @@ restart the session.
 ## Development
 
 ```bash
-node test/smoke.mjs          # 45 checks against real servers, real JSON-RPC, real sockets
+node test/smoke.mjs          # 48 checks against real servers, real JSON-RPC, real sockets
 claude plugin validate .     # manifest check
 claude --plugin-dir "$PWD"   # load into one session only, without a global install
 ```
@@ -196,5 +201,5 @@ lib/bus.mjs             identity, inbox, socket signalling, sweep, rendering
 mcp/server.mjs          MCP server: 4 tools, socket listener, no polling
 hooks/stop-pickup.mjs   Stop hook: end-of-turn delivery, fail-open
 bin/bus.mjs             CLI: list / send / inbox / whoami / sweep
-test/smoke.mjs          45-check smoke suite
+test/smoke.mjs          48-check smoke suite
 ```

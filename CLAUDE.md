@@ -20,7 +20,7 @@ whichever fits its current state.*
 ## Quick Start
 
 ```bash
-node test/smoke.mjs                    # 45 checks, needs nothing installed. Run this first.
+node test/smoke.mjs                    # 48 checks, needs nothing installed. Run this first.
 claude plugin validate .               # manifest check
 
 # Iterating on the code: load this directory directly, no install, no cache.
@@ -57,7 +57,7 @@ lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, r
 .mcp.json               Declares the MCP server (uses ${CLAUDE_PLUGIN_ROOT}).
 .claude-plugin/         plugin.json (the plugin) + marketplace.json (so it is installable).
 .gitignore              nothing is generated; this only guards against accidents.
-test/smoke.mjs          45 checks against real server processes, real JSON-RPC, real sockets.
+test/smoke.mjs          48 checks against real server processes, real JSON-RPC, real sockets.
 ```
 
 ### Runtime state (per machine, never in the repo)
@@ -206,6 +206,16 @@ Settled questions.)
 
 ## Label cleaning
 
+**Labels are refreshed from the live terminal titles at read time, not only at registration.**
+The registered label is a snapshot from server start; `/rename` changes the terminal title but
+nothing ever rewrites the file, so resolving by the new name used to fail (found 2026-08-25:
+a renamed session was unreachable by its new name). `listSessions()` now overlays labels from
+`liveTitlesByTty()` — one batch osascript for all iTerm panes plus one `tmux list-panes -a` —
+and writes nothing back, so the "only write your own state file" invariant holds. An explicit
+`SESSION_BUS_LABEL` sets `pinned: true` at registration and is never overridden. AppleScript
+gotcha pinned in a comment: inside a `tell application "iTerm2"` block, `tab` resolves to
+iTerm's tab *class*, not the character constant — bind the separator outside the block.
+
 Labels come from the terminal title, which arrives decorated: a status glyph, the name, and a
 trailing foreground-process hint. `cleanLabel()` strips trailing parenthesised groups that are
 **short (≤12 chars) and space-free** — `(ps)`, `(zsh)`, `(python3.13)` — and repeats, since a
@@ -245,7 +255,7 @@ no build output, no `node_modules`, and no absolute paths (verified by grep; the
 machine-specific strings are the author emails in `.claude-plugin/*.json`).
 
 1. Update the author fields in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.
-2. `node test/smoke.mjs` — expect 45/45 on the new machine.
+2. `node test/smoke.mjs` — expect 48/48 on the new machine.
 3. `claude plugin validate .` — expect "Validation passed".
 4. **Verify the channel path** (see below) — ✅ done 2026-08-25, passed on first real run.
 5. `git init && git add -A && git commit` then push.

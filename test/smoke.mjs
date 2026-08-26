@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { sweep, knownSessionIds, unread, cleanLabel } from '../lib/bus.mjs'
+import { sweep, knownSessionIds, unread, cleanLabel, register, listSessions } from '../lib/bus.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SERVER = join(HERE, '..', 'mcp', 'server.mjs')
@@ -230,13 +230,32 @@ await new Promise((r) => setTimeout(r, 400))
 const afterDeath = await A.call('sessions_list')
 check('dead peer pruned', !new RegExp(SID.c.slice(0,12)).test(afterDeath), afterDeath)
 
+console.log('\n[12] labels refresh from live terminal titles at read time')
+// A /rename changes the terminal title but nothing ever rewrites the registered file, so
+// listSessions must prefer the live title over the stored snapshot — except for pinned
+// entries (explicit SESSION_BUS_LABEL). Titles are injected here; no terminal needed.
+const renamedSid = `sid-renamed-${RUN}`, pinnedSid = `sid-pinned-${RUN}`
+register({ sid: renamedSid, label: 'stale name', pid: holders[0].pid, tty: '/dev/ttysFAKE1', cwd: '/tmp', pinned: false })
+register({ sid: pinnedSid, label: 'chosen name', pid: holders[0].pid, tty: '/dev/ttysFAKE2', cwd: '/tmp', pinned: true })
+const fresh = new Map([
+  ['/dev/ttysFAKE1', '✳ renamed by user (node)'],
+  ['/dev/ttysFAKE2', '✳ some other title (node)'],
+])
+const refreshed = listSessions({ freshTitles: fresh })
+const r1 = refreshed.find((s) => s.sid === renamedSid)
+const r2 = refreshed.find((s) => s.sid === pinnedSid)
+check('live title overrides the stale registered label', r1?.label === 'renamed by user', JSON.stringify(r1))
+check('pinned label survives a title refresh', r2?.label === 'chosen name', JSON.stringify(r2))
+const noTitle = listSessions({ freshTitles: new Map() }).find((s) => s.sid === renamedSid)
+check('stored label is the fallback when no live title', noTitle?.label === 'stale name', JSON.stringify(noTitle))
+
 for (const p of [A, B, C]) p.kill()
 for (const h of holders) h.kill()
 
 // Clean up this run's fixtures so repeated runs do not accumulate files for the whole TTL.
 await new Promise((r) => setTimeout(r, 200))
 let leftover = 0
-for (const sid of [SID.a, SID.b, SID.c, ghostSid, `sid-nochan-${RUN}`, `sid-chan-${RUN}`]) {
+for (const sid of [SID.a, SID.b, SID.c, ghostSid, `sid-nochan-${RUN}`, `sid-chan-${RUN}`, `sid-renamed-${RUN}`, `sid-pinned-${RUN}`]) {
   for (const [dir, ext] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sock', '.sock'], ['sessions', '.json']]) {
     const f = join(ROOT, dir, `${encodeURIComponent(sid)}${ext}`)
     try { if (existsSync(f)) { unlinkSync(f); leftover++ } } catch {}
