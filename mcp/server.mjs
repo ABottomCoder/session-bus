@@ -4,13 +4,16 @@
 import {
   identity, register, unregister, listSessions, resolveTarget, send, unread,
   markSeen, notifyHuman, formatMessages, listenForSignals, signal, watchInbox, sweep,
-  channelStatus, scrub,
+  channelStatus, scrub, compactCursor,
 } from '../lib/bus.mjs'
 
 const PROTOCOL = '2025-06-18'
 const me = identity()
 try { register(me) } catch {}
 try { sweep() } catch {}
+// Own cursor only (invariant: only write your own state files) and only at start, when no
+// concurrent marker for this sid can be mid-append.
+try { compactCursor(me.sid) } catch {}
 
 const bye = () => { try { unregister(me.sid) } catch {} }
 process.on('exit', bye)
