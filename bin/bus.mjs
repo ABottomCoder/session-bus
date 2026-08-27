@@ -8,7 +8,7 @@
 //   bus sweep
 import {
   identity, register, listSessions, resolveTarget, send, unread, markSeen,
-  formatMessages, signal, sweep,
+  formatMessages, signal, sweep, watcherStatus,
 } from '../lib/bus.mjs'
 
 const argv = process.argv.slice(2)
@@ -34,7 +34,19 @@ if (cmd === 'whoami') {
   const list = listSessions()
   if (!list.length) console.log('(no live sessions registered)')
   for (const s of list) {
-    console.log(`${s.sid === me.sid ? '*' : ' '} ${s.label}\tsid=${s.sid.slice(0, 12)}\tunread=${s.unread}\tpid=${s.pid}`)
+    // idle-pickup is shown because otherwise a human has no way to tell whether a session will act
+    // on mail while idle, short of asking that session — which is exactly the burden the watcher
+    // exists to remove. One command, from any terminal, answers it.
+    const w = watcherStatus(s.sid)
+    const idle = w.armed
+      ? `armed${w.count > 1 ? `x${w.count}` : ''}`
+      : 'NOT-armed'
+    console.log(`${s.sid === me.sid ? '*' : ' '} ${s.label}\tsid=${s.sid.slice(0, 12)}\tunread=${s.unread}\tpid=${s.pid}\tidle-pickup=${idle}`)
+  }
+  const unarmed = list.filter((s) => !watcherStatus(s.sid).armed)
+  if (list.length > 1 && unarmed.length) {
+    console.log(`\n${unarmed.length} session(s) will NOT act on peer mail while idle. In such a session, say:`)
+    console.log('  arm the session-bus watcher')
   }
 } else if (cmd === 'send') {
   const to = argv.shift()

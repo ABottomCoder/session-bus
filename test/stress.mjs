@@ -139,6 +139,17 @@ console.log('\n[S6] cursor format: legacy migration and compaction')
   const raw = readFileSync(join(ROOT, 'cursors', `${encodeURIComponent(sid)}.json`), 'utf8')
   check('compaction squashes to one line', raw.trim().split('\n').length === 1, raw)
   check('compaction preserves unread correctness', unread(sid).length === 2, `unread=${unread(sid).length}`)
+  // Hot-path appends must never be collapsed by the legacy-migration rewrite. A single valid
+  // record surrounded by newlines parsed as "legacy", was rewritten NON-atomically, and raced a
+  // concurrent append — the ~1/20 flake seen in [S2]. Two appends must remain two records.
+  const p6 = join(ROOT, 'cursors', `${encodeURIComponent(sid)}.json`)
+  writeFileSync(p6, '')
+  markSeen(sid, ['r1'])
+  const after1 = readFileSync(p6, 'utf8')
+  markSeen(sid, ['r2'])
+  const after2 = readFileSync(p6, 'utf8')
+  check('append-only cursor is never rewritten on the hot path (old content stays a prefix)',
+    after2.startsWith(after1) && after2.length > after1.length, JSON.stringify({ after1, after2 }))
 }
 
 // ---- [S7] a concurrent sweep must not unlink a LIVE server's bound socket

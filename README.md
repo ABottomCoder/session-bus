@@ -154,10 +154,27 @@ if a pushed message hasn't been picked up within ~25 seconds, you get the notifi
 ### Watcher: autonomous pickup where channels don't work
 
 If channels are unavailable (Bedrock, the desktop app, or an org that blocks the flag), a
-session can still pick mail up on its own — no channel, nothing typed. Ask it to arm the
-watcher, and it will keep the loop going by itself:
+session can still pick mail up on its own — no channel, nothing typed.
 
-> arm the session-bus watcher, then go idle
+**You don't have to set this up, and you don't have to remember it.** Once there is another session
+on the bus, a session arms itself at the end of its next turn and then keeps the loop going. You can
+check the state of every session from any terminal:
+
+```bash
+node bin/bus.mjs list
+```
+
+```
+* review        sid=a1b2c3d4e5f6   unread=0   pid=41163   idle-pickup=armed
+  implement     sid=9f8e7d6c5b4a   unread=0   pid=41161   idle-pickup=NOT-armed
+
+1 session(s) will NOT act on peer mail while idle. In such a session, say:
+  arm the session-bus watcher
+```
+
+If you want one listening immediately rather than after its next turn, just tell it:
+
+> arm the session-bus watcher
 
 Under the hood it runs this as a **background** task and returns to your prompt straight away:
 

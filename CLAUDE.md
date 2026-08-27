@@ -20,9 +20,9 @@ whichever fits its current state.*
 ## Quick Start
 
 ```bash
-node test/smoke.mjs                    # L1: 78 functional checks. Run this first.
+node test/smoke.mjs                    # L1: 103 functional checks. Run this first.
 node test/watch.mjs                    # L1: 69 checks for bin/watch.mjs (autonomous idle pickup)
-node test/stress.mjs                   # L2: 20 concurrency/race checks (multi-process)
+node test/stress.mjs                   # L2: 21 concurrency/race checks (multi-process)
 node test/chaos.mjs                    # L3: 30 fault-injection checks
 claude plugin validate .               # manifest check
 
@@ -58,15 +58,16 @@ bin/watch.mjs           Autonomous idle pickup where channels are unavailable. A
 mcp/server.mjs          MCP server, one instance per session. Hand-rolled JSON-RPC over
                         stdio (no SDK — that is what keeps dependencies at zero).
                         Exposes 4 tools; listens on the session's unix socket.
-hooks/stop-pickup.mjs   Stop hook. Delivers pending messages at the end of a turn.
+hooks/stop-pickup.mjs   Stop hook. Delivers pending messages at the end of a turn, and — once per
+                        session, only where it helps — blocks one turn to get idle pickup armed.
 hooks/hooks.json        Declares the Stop hook to Claude Code.
 lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, rendering.
 .mcp.json               Declares the MCP server (uses ${CLAUDE_PLUGIN_ROOT}).
 .claude-plugin/         plugin.json (the plugin) + marketplace.json (so it is installable).
 .gitignore              nothing is generated; this only guards against accidents.
-test/smoke.mjs          L1: 78 checks against real server processes, real JSON-RPC, real sockets.
+test/smoke.mjs          L1: 103 checks against real server processes, real JSON-RPC, real sockets.
 test/watch.mjs          L1: 69 checks for bin/watch.mjs — real child processes, real inboxes.
-test/stress.mjs         L2: 20 concurrency/race checks — real multi-process interleavings.
+test/stress.mjs         L2: 21 concurrency/race checks — real multi-process interleavings.
 test/chaos.mjs          L3: 30 fault-injection checks — corruption, floods, kills, garbage.
 ```
 
@@ -74,9 +75,9 @@ test/chaos.mjs          L3: 30 fault-injection checks — corruption, floods, ki
 
 | Layer | Evidence | Result |
 |---|---|---|
-| L1 business | smoke.mjs 78 checks (was 55; +3 empty-inbox reclamation, +6 stale-snapshot sweep race, +2 watcher-file permissions, +11 idle-pickup disclosure, +1 corrected wake-latency measurement) | ✅ 78/78, and **stable**: repeated clean runs at load 4.5 where it previously failed ~50% |
+| L1 business | smoke.mjs 103 checks (was 55; +3 empty-inbox reclamation, +6 stale-snapshot sweep race, +2 watcher-file permissions, +11 idle-pickup disclosure, +1 corrected wake-latency measurement, +14 that a fresh session is told how to arm idle pickup, +11 that the Stop hook gets it armed) | ✅ 103/103, and **stable**: repeated clean runs at load 4.5 where it previously failed ~50% |
 | L1 watcher | watch.mjs 69 checks (2026-08-26, v0.10.0): wake, already-pending early-out, burst coalescing, drain-during-settle must NOT wake, cursor untouched, socket untouched, body non-disclosure, kill reports deafness with non-zero exit, armed-state registration + deregistration on every exit path, SIGKILL reads as not-armed, sweep reclaims stale registrations, fs.watch-failure branch, per-pid registration with no mutual deregistration | ✅ 69/69 |
-| L2 concurrency | stress.mjs 20 checks; found+fixed cursor RMW race (96/200 lost), 500-id seen-cap resurrection, and [S7] a live session's socket being swept by another server's stale snapshot | ✅ 20/20 after fix |
+| L2 concurrency | stress.mjs 21 checks; found+fixed a hot-path cursor rewrite that misread one appended record as a legacy file ([S6]), found+fixed cursor RMW race (96/200 lost), 500-id seen-cap resurrection, and [S7] a live session's socket being swept by another server's stale snapshot | ✅ 21/21 after fix |
 | L3 fault/chaos | chaos.mjs 30 checks (+5 for corrupt/hostile watcher registrations); found+fixed newline-fusion append loss; flood batching + alert coalescing added after v0.5 review; SIGKILL recovery, floods, corruption all clean | ✅ 30/30 after fix |
 | L4 security | semgrep OSS important-only (p/javascript+nodejs+trailofbits+secrets): 0 findings; gitleaks full history: 0 leaks; zero deps → no CVE surface; hardening suite in smoke [13] | ✅ |
 | L5 observability | sessions_list reports true mode+reason (desktop, no channels); dead-socket send discloses WARNING + storage; live E2E: new sender × old cached receiver over channel path, autonomous ack in ~1s | ✅ |
@@ -290,6 +291,62 @@ Four properties are load-bearing, each with a test:
    reported not-armed while a live watcher was still listening, so senders were told the peer would
    not act when it would. `watcherStatus` now reports `count`, and `session_send` warns when more
    than one is armed, because that means duplicate wakes for one message.
+
+#### The instructions are the only thing a fresh session reads
+
+For a while the watcher shipped, was tested, and **no session ever used it**. `README.md` and this
+file are read by humans; the MCP server's `instructions` string is the only thing a fresh session
+actually sees, and it said nothing about the watcher. So sessions could send and receive but silently
+never acted on mail unprompted — the capability existed and the behaviour did not.
+
+`instructions` now carries an IDLE PICKUP section, **only when channels are unavailable** (a
+channel-capable session needs no watcher and arming one would just add a redundant wake per message).
+It contains the runnable command with that session's own sid and an absolute script path derived from
+`import.meta.url`, so it is right whether the plugin was installed into the cache or loaded with
+`--plugin-dir`. It also carries the parts of the protocol that are easy to get wrong: run it in the
+background, prefer it over `session_wait` and why, drain `session_inbox` to empty, do not arm twice,
+a non-zero exit means deaf, an empty inbox on wake is normal.
+
+`sessions_list` now points at the fix rather than only stating the problem: when nothing is armed it
+says so and says to arm one; when a watcher is armed it reports that as the session's idle-delivery
+mode. Pinned by smoke [15], including the negative case — a channel-capable session must NOT be told
+to arm one.
+
+**If you add a capability a session is meant to use on its own, put it here, or it will not happen.**
+
+#### Arming has to be automatic, because the human cannot be the watchdog
+
+The first version of this required the human to notice whether a session had armed a watcher and to
+say "arm the session-bus watcher" if not. That is the same burden the watcher exists to remove, so it
+was not a design — it was an unfinished one.
+
+**Why it cannot be armed inside the plugin.** The wake comes from Claude Code re-invoking the model
+when a background task *it* launched exits. A process the MCP server spawns is invisible to that
+bookkeeping: it would watch the inbox and wake nobody. So the Bash tool must be the launcher, and
+only the model can call it.
+
+**So the Stop hook is the enforcement point.** It already runs at the end of every turn and already
+injects context. When there is no mail to deliver it now blocks **one** turn with the runnable arm
+command. After that the wake → drain → re-arm loop sustains itself and the hook stays quiet.
+
+Gated deliberately, because a background process per session is not free:
+
+| Gate | Why |
+|---|---|
+| channels unavailable | with channels there is nothing to fix |
+| not already armed | including a watcher armed by an earlier turn |
+| at least one live peer | alone on the bus, nobody can message this session |
+| not already prompted | **the hook cannot arm the watcher, so it cannot clear its own condition** |
+
+That last gate is the important one. Without a latch the hook would block at the end of *every* turn
+— the same non-convergence the mail path avoids by advancing the cursor before blocking. The latch is
+`armPrompted` in the session's own registration file: writable under invariant 2, reset naturally by
+a restart, no extra directory, and written atomically because `listSessions()` drops any session whose
+file will not parse.
+
+Mail always outranks the prompt, and `bin/bus.mjs list` reports `idle-pickup=armed|NOT-armed` per
+session so a human can answer "is it listening?" from any terminal instead of asking the session.
+Pinned by smoke [9b] (11 checks, including the no-nag-loop case and mail-outranks-prompt).
 
 Operational notes:
 

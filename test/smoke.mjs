@@ -8,7 +8,7 @@ import { homedir } from 'node:os'
 import {
   sweep, knownSessionIds, unread, cleanLabel, register, listSessions, send, formatMessages,
   scrub, MAX_BODY, ROOT as BUS_ROOT, isLiveSid, armWatcher, disarmWatcher, watcherStatus,
-  signal,
+  signal, markArmPrompted,
 } from '../lib/bus.mjs'
 import { statSync } from 'node:fs'
 
@@ -287,10 +287,79 @@ try { hook = JSON.parse(hookOut) } catch {}
 check('hook emits valid JSON', !!hook, hookOut.slice(0, 200))
 check('hook used the stdin session_id, not the env', /hook payload via sid/.test(JSON.stringify(hook)), hookOut.slice(0, 300))
 check('hook blocks the stop', hook?.decision === 'block' && hook?.hookSpecificOutput?.block === true)
+// Latch the arm prompt first: with mail drained the hook's OTHER job (getting idle pickup armed)
+// would fire here and this check is about the mail path not re-delivering. The arm prompt has its
+// own section, [9b].
+markArmPrompted(SID.b)
 const hookOut2 = execFileSync('node', [HOOK], {
   encoding: 'utf8', input: JSON.stringify({ session_id: SID.b }),
 })
 check('hook silent when drained (no block loop)', hookOut2.trim() === '', JSON.stringify(hookOut2))
+
+console.log('\n[9b] Stop hook prompts a session to arm idle pickup — once, and only when it helps')
+// Arming cannot be automated inside the plugin: the wake comes from Claude Code re-invoking the
+// model when a task IT launched exits, so the Bash tool must be the launcher and only the model can
+// call it. The hook is the enforcement point instead — it blocks the end of ONE turn to get the
+// watcher armed, after which the wake -> drain -> re-arm loop sustains itself. The human never has
+// to notice whether a session is armed.
+{
+  const runHook = (sid) => {
+    const out = execFileSync('node', [HOOK], {
+      encoding: 'utf8',
+      input: JSON.stringify({ session_id: sid, hook_event_name: 'Stop' }),
+      env: { ...process.env, SESSION_BUS_NO_CHANNEL: '1' },
+    })
+    try { return JSON.parse(out) } catch { return out.trim() === '' ? null : out }
+  }
+
+  // A fresh session: live, no mail, not armed, never prompted, with A/B/C on the bus.
+  const freshSid = `sid-armprompt-fresh-${RUN}`
+  const holderF = spawn('sleep', ['30'])
+  register({ sid: freshSid, label: 'fresh-one', pid: holderF.pid, tty: null, cwd: '/tmp' })
+  const first = runHook(freshSid)
+  check('prompts when peers exist, nothing is armed and no channel', !!first?.decision, JSON.stringify(first).slice(0, 200))
+  const ctx = first?.hookSpecificOutput?.additionalContext || ''
+  check('the prompt names the peers that can message it', /other session\(s\) are on the bus/.test(ctx), ctx.slice(0, 200))
+  check('the prompt carries the runnable command with the right sid',
+    ctx.includes(`bin/watch.mjs --sid ${freshSid}`), ctx.slice(0, 400))
+  check('the prompt says to run it in the background', /run_in_background/.test(ctx))
+  check('the prompt says it does not block the human', /does not block the human/.test(ctx))
+  check('the prompt states it appears once per session', /once per session/.test(ctx))
+
+  // Second call must be silent. The hook cannot arm the watcher itself, so without a latch it
+  // would block at the end of EVERY turn — the same non-convergence the mail path avoids by
+  // advancing the cursor before blocking.
+  check('does NOT prompt a second time (no nag loop)', runHook(freshSid) === null)
+  holderF.kill()
+
+  // Already armed -> nothing to fix, even in a fresh session that was never prompted.
+  const armedSid = `sid-armprompt-armed-${RUN}`
+  const holderAP = spawn('sleep', ['30'])
+  register({ sid: armedSid, label: 'armed-one', pid: holderAP.pid, tty: null, cwd: '/tmp' })
+  armWatcher({ sid: armedSid, pid: process.pid, timeoutS: 900 })
+  check('does NOT prompt a session that is already armed', runHook(armedSid) === null)
+  disarmWatcher(armedSid, process.pid)
+  check('...and DOES prompt the same session once it is no longer armed', !!runHook(armedSid)?.decision)
+  holderAP.kill()
+
+  // Mail always wins: a session with unread mail gets the mail, not the arm prompt.
+  const mailSid = `sid-armprompt-mail-${RUN}`
+  const holderM = spawn('sleep', ['30'])
+  register({ sid: mailSid, label: 'has-mail', pid: holderM.pid, tty: null, cwd: '/tmp' })
+  send({ toSid: mailSid, from: SID.a, fromLabel: 'alpha', body: 'mail outranks the arm prompt' })
+  const mailOut = runHook(mailSid)
+  check('a session with unread mail gets the MAIL, not the arm prompt',
+    /mail outranks the arm prompt/.test(JSON.stringify(mailOut)), JSON.stringify(mailOut).slice(0, 200))
+  check('and that delivery is not the arm prompt',
+    !/other session\(s\) are on the bus/.test(JSON.stringify(mailOut)))
+  holderM.kill()
+
+  for (const sid of [freshSid, armedSid, mailSid]) {
+    for (const [d, e] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sessions', '.json'], ['sock', '.sock']]) {
+      try { unlinkSync(join(ROOT, d, `${encodeURIComponent(sid)}${e}`)) } catch {}
+    }
+  }
+}
 
 console.log('\n[10] unreachable target degrades honestly')
 // A registered session whose process is alive but which has no listening socket.
@@ -389,13 +458,61 @@ console.log('\n[14] session_send and sessions_list disclose whether the target c
   await B.call('session_inbox')
 }
 
+console.log('\n[15] a fresh session is TOLD how to pick mail up while idle')
+// The capability existed for a while and no session used it: README and CLAUDE.md are read by
+// humans, while the server's `instructions` are the only thing a fresh session actually sees. If
+// this regresses, sessions still send and receive but silently stop acting on mail unprompted.
+{
+  const initA = await A.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {} })
+  const ins = initA.result?.instructions || ''
+  check('instructions state that idle pickup is not automatic here',
+    /IDLE PICKUP IS NOT AUTOMATIC/.test(ins), ins.slice(-400))
+  check('instructions give the runnable watcher command',
+    /bin\/watch\.mjs --sid /.test(ins), ins.slice(-400))
+  check('the command carries this session\'s OWN sid', ins.includes(`--sid ${SID.a}`), ins.slice(-400))
+  check('the path is absolute, so it works from any cwd', /node \//.test(ins), ins.slice(-400))
+  check('instructions say to run it in the background', /run_in_background/.test(ins))
+  check('instructions prefer it over session_wait, with the reason',
+    /Prefer it over session_wait/.test(ins) && /queues your/.test(ins))
+  check('instructions require draining session_inbox to empty', /REPEATEDLY until it reports empty/.test(ins))
+  check('instructions warn against double-arming', /Do not arm twice/.test(ins))
+  check('instructions explain a non-zero exit means deaf', /no longer\nlistening|no longer listening/.test(ins))
+  check('instructions normalise an empty inbox on wake', /empty inbox on wake is normal/.test(ins))
+
+  // The guidance is conditional: a channel-capable session does not need a watcher, and telling it
+  // to arm one would cost a redundant wake for every message.
+  const chanSid = `sid-instr-chan-${RUN}`
+  const holderI = spawn('sleep', ['30'])
+  const I = new Peer({
+    sid: chanSid, label: 'instrchan', pid: holderI.pid,
+    env: { SESSION_BUS_NO_CHANNEL: '', SESSION_BUS_FORCE_CHANNEL: '1' },
+  })
+  const initI = await I.rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {} })
+  const insI = initI.result?.instructions || ''
+  check('a channel-capable session is NOT told to arm a watcher',
+    !/IDLE PICKUP IS NOT AUTOMATIC/.test(insI), insI.slice(-200))
+  check('but it still gets the normal bus instructions', /session_send/.test(insI))
+  I.kill(); holderI.kill()
+
+  // sessions_list should point at the fix, not merely state the problem.
+  const listNoWatcher = await A.call('sessions_list')
+  check('sessions_list says no watcher is armed and to arm one',
+    /No watcher is armed/.test(listNoWatcher) && /Arm one if you are expecting a reply/.test(listNoWatcher),
+    listNoWatcher)
+  armWatcher({ sid: SID.a, pid: process.pid, timeoutS: 900 })
+  const listArmed = await A.call('sessions_list')
+  check('sessions_list reports its own mode as watcher armed',
+    /watcher armed \(pid/.test(listArmed), listArmed)
+  disarmWatcher(SID.a, process.pid)
+}
+
 for (const p of [A, B, C]) p.kill()
 for (const h of holders) h.kill()
 
 // Clean up this run's fixtures so repeated runs do not accumulate files for the whole TTL.
 await new Promise((r) => setTimeout(r, 200))
 let leftover = 0
-for (const sid of [SID.a, SID.b, SID.c, ghostSid, `sid-nochan-${RUN}`, `sid-chan-${RUN}`, `sid-renamed-${RUN}`, `sid-pinned-${RUN}`, `sid-hostile-${RUN}`]) {
+for (const sid of [SID.a, SID.b, SID.c, ghostSid, `sid-nochan-${RUN}`, `sid-chan-${RUN}`, `sid-renamed-${RUN}`, `sid-pinned-${RUN}`, `sid-hostile-${RUN}`, `sid-instr-chan-${RUN}`, `sid-snapshot-race-${RUN}`, `sid-really-dead-${RUN}`]) {
   for (const [dir, ext] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sock', '.sock'], ['sessions', '.json']]) {
     const f = join(ROOT, dir, `${encodeURIComponent(sid)}${ext}`)
     try { if (existsSync(f)) { unlinkSync(f); leftover++ } } catch {}
