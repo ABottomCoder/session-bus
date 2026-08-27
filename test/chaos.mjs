@@ -5,10 +5,12 @@
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync } from 'node:fs'
+import { writeFileSync, appendFileSync, unlinkSync, existsSync, readFileSync, mkdirSync, readdirSync } from 'node:fs'
 import { connect } from 'node:net'
 import { homedir } from 'node:os'
-import { send, readInbox, unread, markSeen, signal, sockPath, formatMessages } from '../lib/bus.mjs'
+import {
+  send, readInbox, unread, markSeen, signal, sockPath, formatMessages, watcherStatus, sweep,
+} from '../lib/bus.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SERVER = join(HERE, '..', 'mcp', 'server.mjs')
@@ -211,12 +213,72 @@ console.log('\n[C9] notification gate: empty→non-empty alerts, floods stay qui
   check('drained-then-new-message alerts immediately', gate(1, t + 14_000) === true)
 }
 
+console.log('\n[C10] corrupt or hostile watcher registrations degrade to "not armed", never throw')
+// watcherStatus() is called on the send path, so a bad file here must not take a send down with
+// it — and it must never claim armed on evidence it cannot trust. "Not armed" is the safe answer:
+// it makes a sender warn the human, whereas a false "armed" would make it report a message as
+// actionable when nothing is listening.
+{
+  const sid = sidOf('watchcorrupt')
+  const wdir = join(ROOT, 'watchers')
+  mkdirSync(wdir, { recursive: true })
+  const wpath = (pid) => join(wdir, `${encodeURIComponent(sid)}__${pid}.json`)
+  const cases = [
+    ['truncated JSON', '{"sid":"x","pid":'],
+    ['not JSON at all', 'this is not json'],
+    ['empty file', ''],
+    ['valid JSON, no pid', JSON.stringify({ sid, timeoutS: 60 })],
+    ['pid is a string', JSON.stringify({ sid, pid: 'not-a-number', timeoutS: 60 })],
+    ['pid is negative', JSON.stringify({ sid, pid: -5, timeoutS: 60 })],
+    ['pid 0', JSON.stringify({ sid, pid: 0, timeoutS: 60 })],
+    ['pid that cannot exist', JSON.stringify({ sid, pid: 4294967295, timeoutS: 60 })],
+    ['a JSON array', JSON.stringify([1, 2, 3])],
+    ['NUL and control bytes', '{"pid": [2J}'],
+  ]
+  let threw = null, claimedArmed = []
+  for (const [name, body] of cases) {
+    try { writeFileSync(wpath(name.replace(/\W/g, '')), body) } catch {}
+    try {
+      const st = watcherStatus(sid)
+      if (st.armed) claimedArmed.push(name)
+    } catch (e) { threw = `${name}: ${e.message}` }
+  }
+  check('no corrupt registration made watcherStatus throw', threw === null, String(threw))
+  check('no corrupt registration was reported as armed', claimedArmed.length === 0,
+    claimedArmed.join('; '))
+
+  // A registration whose pid is alive but which is otherwise minimal must still read as armed —
+  // the guard must not be so strict that it ignores real watchers.
+  writeFileSync(wpath(process.pid), JSON.stringify({ sid, pid: process.pid }))
+  const good = watcherStatus(sid)
+  check('a minimal but LIVE registration still reads as armed', good.armed === true, JSON.stringify(good))
+  check('missing timeoutS degrades to null rather than breaking', good.timeoutS === null, JSON.stringify(good))
+
+  // sweep() must reclaim every unusable file rather than leaving litter that is re-parsed forever.
+  sweep()
+  let leftover = 0
+  try {
+    for (const f of readdirSync(wdir)) {
+      if (f.startsWith(`${encodeURIComponent(sid)}__`) && !f.endsWith(`__${process.pid}.json`)) leftover++
+    }
+  } catch {}
+  check('sweep reclaimed all the unusable registrations', leftover === 0, `leftover=${leftover}`)
+  try { unlinkSync(wpath(process.pid)) } catch {}
+}
+
 // ---- cleanup
 for (const sid of cleanup) {
   for (const [dir, ext] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sock', '.sock'], ['sessions', '.json']]) {
     const f = join(ROOT, dir, `${encodeURIComponent(sid)}${ext}`)
     try { if (existsSync(f)) unlinkSync(f) } catch {}
   }
+  try {
+    for (const f of readdirSync(join(ROOT, 'watchers'))) {
+      if (f.startsWith(`${encodeURIComponent(sid)}__`)) {
+        try { unlinkSync(join(ROOT, 'watchers', f)) } catch {}
+      }
+    }
+  } catch {}
 }
 console.log(`\n==== ${pass} passed, ${fail} failed ====`)
 process.exit(fail ? 1 : 0)

@@ -107,7 +107,8 @@ destructive.
 | Waiting on `session_wait` | socket event → tool result | **~25ms measured** | No |
 | Working (mid-turn) | Stop hook → end-of-turn context | end of turn | No |
 | Idle, **channels available** | pushed straight in as a channel event | immediate | No |
-| Idle, no channels | macOS notification + terminal bell | — | **Say anything to it** |
+| Idle, **watcher armed** (`bin/watch.mjs`) | background task exits → wakes the session | **~11s measured** (8s settle + watch latency) | No |
+| Idle, nothing armed, no channels | macOS notification + terminal bell | — | **Say anything to it** |
 
 There is **no polling anywhere** in the delivery path.
 
@@ -145,10 +146,60 @@ claude --dangerously-load-development-channels plugin:session-bus@session-bus
 Run `sessions_list` and check the reported idle-delivery mode. If it says `channel push`,
 you're set. If it says `notify-the-human when idle`, it tells you exactly why.
 
-**Where channels don't work, nothing breaks** — delivery falls back to the other three paths,
-and the last row above applies: type anything and the message lands at the end of that turn.
+**Where channels don't work, nothing breaks** — delivery falls back to the other paths, and the
+last row above applies: type anything and the message lands at the end of that turn.
 Because a channel push is never acknowledged by Claude Code, session-bus also double-checks:
 if a pushed message hasn't been picked up within ~25 seconds, you get the notification anyway.
+
+### Watcher: autonomous pickup where channels don't work
+
+If channels are unavailable (Bedrock, the desktop app, or an org that blocks the flag), a
+session can still pick mail up on its own — no channel, nothing typed. Ask it to arm the
+watcher, and it will keep the loop going by itself:
+
+> arm the session-bus watcher, then go idle
+
+Under the hood it runs this as a **background** task and returns to your prompt straight away:
+
+```bash
+node bin/watch.mjs --sid <its-own-sid> --timeout-s 1800 --settle-ms 8000
+```
+
+The trick is that Claude Code re-invokes a session when a background task **exits** — and that
+wake reaches a session sitting idle. So a process that blocks until there is genuinely unread
+mail, then exits, supplies the wake that channels would otherwise provide. On wake the session
+drains `session_inbox` and re-arms.
+
+Why this is better than `session_wait` for the same job: `session_wait` blocks the session's
+turn, so **you** can't talk to it while it waits. The watcher lives outside the turn, so the
+session stays responsive to you and to its peers at the same time.
+
+**You can see whether a session is listening.** `sessions_list` reports `idle-pickup=armed` or
+`NOT armed` for every peer, and `session_send` tells the sender which it got — when the target
+isn't armed it says so and warns against reporting the message as received. That matters at the end
+of a collaboration: if one side stops re-arming and the other keeps sending, the message is still
+stored durably and you still get a notification, but nothing will act on it until you say something
+to that session. Without the disclosure, a sending session can mistake "delivered" for "read".
+
+Four behaviours worth knowing:
+
+- **An expiry is honest, not a failure.** After `--timeout-s` with no mail it wakes once and
+  says nothing arrived. Size the timeout to how long you actually expect to wait; every expiry
+  costs one cheap turn.
+- **Don't arm two watchers on one session.** You'd get two wakes for one message. `session_send`
+  warns when it sees more than one armed, so if you see that warning something is re-arming without
+  checking first. Nothing is lost either way.
+- **A killed watcher says so.** If something kills it, it reports that the session is no longer
+  armed and exits non-zero, rather than leaving a session that looks armed but is deaf. To stop
+  one deliberately, use `TaskStop` with its task id — a broad `pkill -f` will also kill the
+  watchers of *other* sessions on the machine.
+- **When you're done, wind down with a drain window.** Don't disarm the instant you send a final
+  message; re-arm once with a short timeout (e.g. `--timeout-s 120`) and stop after it expires with
+  an empty inbox. Nothing can make this airtight — that's the Two Generals' Problem — but combined
+  with the durable inbox and the `NOT armed` disclosure above, nothing gets lost or misreported.
+
+Verified on Bedrock (2026-08-26), where channels are dropped: two sessions exchanged messages
+and acted on them with zero human input on either side.
 
 ## Inbox lifetime
 

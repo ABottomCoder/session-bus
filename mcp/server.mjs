@@ -4,7 +4,7 @@
 import {
   identity, register, unregister, listSessions, resolveTarget, send, unread,
   markSeen, notifyHuman, formatMessages, listenForSignals, signal, watchInbox, sweep,
-  channelStatus, scrub, compactCursor, deliveryBatch, makeAlertGate,
+  channelStatus, scrub, compactCursor, deliveryBatch, makeAlertGate, watcherStatus,
 } from '../lib/bus.mjs'
 
 const PROTOCOL = '2025-06-18'
@@ -185,7 +185,14 @@ const TOOLS = [
 // process could have written — scrub it before it reaches model context.
 const describe = (list) =>
   list.length
-    ? list.map((s) => `- ${s.label}  [id ${s.sid.slice(0, 12)}]  cwd=${scrub(s.cwd).slice(0, 200)}${s.unread ? `  ${s.unread} unread` : ''}`).join('\n')
+    ? list.map((s) => {
+      // Whether a peer can act while idle is the single most useful thing to know before sending,
+      // so it is shown per peer rather than left to be discovered after the fact.
+      const w = watcherStatus(s.sid)
+      return `- ${s.label}  [id ${s.sid.slice(0, 12)}]  cwd=${scrub(s.cwd).slice(0, 200)}` +
+        `${s.unread ? `  ${s.unread} unread` : ''}` +
+        `  idle-pickup=${w.armed ? 'armed' : 'NOT armed'}`
+    }).join('\n')
     : '(none — no other live sessions on the bus)'
 
 function deliverUnread() {
@@ -226,15 +233,31 @@ async function callTool(name, args = {}) {
       type: 'deliver', id: msg.id, from: me.sid, fromLabel: me.label,
       preview: String(args.body).slice(0, 140),
     })
+    // Say what will actually happen, not what might. Enumerating every possible path reads as
+    // reassurance and invites the sender to report "the peer received it" — which happened for
+    // real. If the target is idle with no channel and no watcher, that is a materially different
+    // outcome and has to be stated as one.
+    const w = watcherStatus(match.sid)
+    const idlePickup = w.armed
+      ? `Idle pickup: ARMED (watcher pid ${w.pid}${w.timeoutS ? `, ${w.timeoutS}s window` : ''}), ` +
+        'so it can act on this without its human.' +
+        (w.count > 1
+          ? ` NOTE: ${w.count} watchers are armed for that session, so it will be woken ${w.count} ` +
+            'times for this one message. Tell the user — something is re-arming without checking.'
+          : '')
+      : 'Idle pickup: NOT ARMED — no watcher registered for that session. If it is idle right now, ' +
+        'only its human has been alerted (notification + bell) and it will NOT act until they say ' +
+        'something to it. Do NOT report this as received or acted on.'
     return text(
       `Delivered to "${match.label}" [id ${match.sid.slice(0, 12)}], message id ${msg.id}.\n` +
       (signalled
-        ? 'Its server accepted the delivery signal. If it is waiting on session_wait it already ' +
-          'woke; if it is mid-turn its Stop hook picks it up at the end of that turn; if it is ' +
-          'idle it is pushed in as a channel event when that session has channels enabled, ' +
-          'otherwise its human is notified (macOS notification + terminal bell).'
+        ? 'Its server accepted the delivery signal, so if it is blocked in session_wait it already ' +
+          'woke, and if it is mid-turn its Stop hook picks this up at the end of that turn.\n'
         : 'WARNING: could not reach that session\'s delivery socket, so no live signal was sent. ' +
-          'The message is stored and will be read on its next inbox check. Tell the user this.'),
+          'The message is stored and will be read on its next inbox check. Tell the user this.\n') +
+      idlePickup +
+      '\nEither way the message is stored durably and is never lost; what varies is only whether ' +
+      'anything will notice it unprompted.',
     )
   }
 
@@ -301,7 +324,7 @@ async function handle(req) {
         // silently dropped (verified on Bedrock).
         experimental: { 'claude/channel': {} },
       },
-      serverInfo: { name: 'session-bus', version: '0.6.0' },
+      serverInfo: { name: 'session-bus', version: '0.10.0' },
       instructions: INSTRUCTIONS,
     })
   }

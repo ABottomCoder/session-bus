@@ -8,7 +8,10 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { unlinkSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { send, readInbox, unread, markSeen, register, listSessions } from '../lib/bus.mjs'
+import {
+  send, readInbox, unread, markSeen, register, listSessions,
+  sweep, isLiveSid, knownSessionIds, signal,
+} from '../lib/bus.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(homedir(), '.claude', 'session-bus')
@@ -138,9 +141,70 @@ console.log('\n[S6] cursor format: legacy migration and compaction')
   check('compaction preserves unread correctness', unread(sid).length === 2, `unread=${unread(sid).length}`)
 }
 
+// ---- [S7] a concurrent sweep must not unlink a LIVE server's bound socket
+//
+// The real bug behind a flake that presented as "session_wait doesn't wake". sweep() runs on every
+// server start and used to decide from a live SNAPSHOT that costs ~210ms to build (osascript title
+// refresh plus a scan of every transcript). A session that registered and bound its socket inside
+// that window was missing from the snapshot and — being brand new — had no transcript either, so
+// another starting server deleted its socket while it was fully alive. The victim then stays
+// unreachable for live signals until it restarts: nothing recreates the path, so every send to it
+// degrades to "could not reach that session's delivery socket". Real sessions have no transcript at
+// startup either, so this was a production race, not a test artifact.
+//
+// Measured before the fix: 4 of 12 simultaneous starts lost the socket (bound ~330ms, unlinked
+// ~345ms); with sweep() disabled, 12 of 12 survived.
+//
+// Racing two real servers reproduces it only 17-33% of the time and the rate moves with machine
+// load, which makes it useless as a gate — a green run would mean nothing. So the timing dependence
+// is removed instead of gambled on: a REAL server with a REAL bound socket, and the stale snapshot
+// injected directly. Deterministic, and still end-to-end, because the last check proves the socket
+// is not merely present but still accepting signals.
+{
+  const SERVER = join(HERE, '..', 'mcp', 'server.mjs')
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  const sid = sidOf('sweep-victim')
+  const holder = spawn('sleep', ['30'])
+  const proc = spawn('node', [SERVER], {
+    env: {
+      ...process.env,
+      SESSION_BUS_SID: sid, SESSION_BUS_LABEL: 'sweepvictim', SESSION_BUS_PID: String(holder.pid),
+      SESSION_BUS_BELL: '0', SESSION_BUS_NO_CHANNEL: '1',
+    },
+    stdio: ['pipe', 'ignore', 'ignore'],
+  })
+  proc.stdin.write(JSON.stringify({
+    jsonrpc: '2.0', id: 1, method: 'initialize',
+    params: { protocolVersion: '2025-06-18', capabilities: {} },
+  }) + '\n')
+
+  const sp = join(ROOT, 'sock', `${encodeURIComponent(sid)}.sock`)
+  for (let t = 0; t < 6000 && !existsSync(sp); t += 25) await sleep(25)
+
+  check('the victim server bound its delivery socket', existsSync(sp), sp)
+  check('it is live according to its own session file', isLiveSid(sid))
+  check('and it is invisible to the transcript guard (as any new session is)',
+    !knownSessionIds().has(sid))
+
+  // Exactly what another server's sweep saw: a snapshot taken before this session registered.
+  const removed = sweep({ live: new Set() })
+  check('a live bound socket survives a stale-snapshot sweep', existsSync(sp),
+    `removed=${removed.filter((p) => p.includes(encodeURIComponent(sid))).join(',')}`)
+  check('the sweep did not report it as reclaimed',
+    !removed.some((p) => p.includes(encodeURIComponent(sid))), removed.join(','))
+
+  // The property that actually matters: still reachable, not just still present on disk.
+  const delivered = await signal(sid, { type: 'deliver', id: `s5-${RUN}`, from: 'stress', preview: 'x' })
+  check('the session is still reachable for live signals after the sweep', delivered === true)
+
+  try { proc.kill() } catch {}
+  try { holder.kill() } catch {}
+  await sleep(150)
+}
+
 // ---- cleanup
 for (const sid of cleanup) {
-  for (const [dir, ext] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sock', '.sock'], ['sessions', '.json']]) {
+  for (const [dir, ext] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sock', '.sock'], ['sessions', '.json'], ['watchers', '.json']]) {
     const f = join(ROOT, dir, `${encodeURIComponent(sid)}${ext}`)
     try { if (existsSync(f)) unlinkSync(f) } catch {}
   }

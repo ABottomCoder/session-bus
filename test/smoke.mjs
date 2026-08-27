@@ -7,7 +7,8 @@ import { appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from
 import { homedir } from 'node:os'
 import {
   sweep, knownSessionIds, unread, cleanLabel, register, listSessions, send, formatMessages,
-  scrub, MAX_BODY, ROOT as BUS_ROOT,
+  scrub, MAX_BODY, ROOT as BUS_ROOT, isLiveSid, armWatcher, disarmWatcher, watcherStatus,
+  signal,
 } from '../lib/bus.mjs'
 import { statSync } from 'node:fs'
 
@@ -111,15 +112,32 @@ check('it reached C, not B', /routed by id/.test(await C.call('session_inbox')))
 check('B got nothing', /Inbox empty/.test(await B.call('session_inbox')))
 
 console.log('\n[4] socket wake is event-driven (no 500ms poll floor)')
-const t0 = Date.now()
+// End-to-end first: a send through the real tool must wake a real waiter.
 const waiting = B.call('session_wait', { timeout_s: 20 })
 await new Promise((r) => setTimeout(r, 800))
-const tSend = Date.now()
 await A.call('session_send', { to: SID.b, body: 'event driven payload' })
 const got = await waiting
-const lag = Date.now() - tSend
 check('wait returned the message', /event driven payload/.test(got), got)
-check(`wake lag ${lag}ms is event-speed (<250ms)`, lag < 250, `lag=${lag}ms, total=${Date.now() - t0}ms`)
+
+// Then the latency claim, measured from the moment the message becomes AVAILABLE rather than
+// from before the send call. Timing the tool call folded in the sender's own listSessions()
+// (~210ms, almost all of it the osascript terminal-title refresh), which left ~40ms of headroom
+// under a 250ms threshold and made this assertion fail on a busy machine at 255-264ms — a
+// measurement artefact, not a slow wake. The sender's title refresh is not what "event-driven"
+// is about; the wake is.
+const waiting2 = B.call('session_wait', { timeout_s: 20 })
+await new Promise((r) => setTimeout(r, 800))
+const tAvail = Date.now()
+const direct = send({ toSid: SID.b, from: SID.a, fromLabel: 'alpha', body: 'direct wake payload' })
+await signal(SID.b, {
+  type: 'deliver', id: direct.id, from: SID.a, fromLabel: 'alpha', preview: 'direct wake payload',
+})
+const got2 = await waiting2
+const lag = Date.now() - tAvail
+check('the second wait returned the directly-signalled message',
+  /direct wake payload/.test(got2), got2)
+check(`wake lag ${lag}ms is event-speed (<250ms, a poll floor would be ~500ms)`, lag < 250,
+  `lag=${lag}ms`)
 
 console.log('\n[5] timeout is a clean result')
 const tt = Date.now()
@@ -151,6 +169,64 @@ const swept = sweep()
 check('orphaned inbox is deleted', !existsSync(inboxOf(orphanSid)), swept.join(','))
 check('dormant session keeps its inbox', existsSync(inboxOf(dormantSid)))
 try { unlinkSync(inboxOf(dormantSid)) } catch {}
+
+// An EMPTY inbox for a still-existing session is reclaimed. watchInbox() creates one at every
+// server start, so without this every session that ever ran leaves a 0-byte file that the
+// known-sid guard protects for as long as its transcript exists — and retention can be
+// effectively permanent. Nothing can be lost: the file holds no messages.
+const emptyDormant = knownIds[1] || dormantSid
+const cursorOf = (sid) => join(ROOT, 'cursors', `${encodeURIComponent(sid)}.json`)
+writeFileSync(inboxOf(emptyDormant), '')
+writeFileSync(cursorOf(emptyDormant), JSON.stringify({ seen: [] }))
+const swept2 = sweep()
+check('EMPTY inbox of a still-existing session is reclaimed',
+  !existsSync(inboxOf(emptyDormant)), swept2.join(','))
+check('that session\'s cursor is NOT removed with it (only inboxes are reclaimed)',
+  existsSync(cursorOf(emptyDormant)))
+// A non-empty inbox for the same kind of session must still be protected.
+writeFileSync(inboxOf(emptyDormant), JSON.stringify({ id: `keep-${RUN}`, ts: new Date().toISOString(), from: SID.a, to: emptyDormant, kind: 'msg', body: 'unread mail for a closed session' }) + '\n')
+sweep()
+check('a NON-empty inbox of a still-existing session survives sweep',
+  existsSync(inboxOf(emptyDormant)))
+try { unlinkSync(inboxOf(emptyDormant)) } catch {}
+try { unlinkSync(cursorOf(emptyDormant)) } catch {}
+
+// A LIVE session missing from the live SNAPSHOT must survive sweep untouched.
+//
+// This is the socket-deletion race, made deterministic by injecting the stale snapshot instead of
+// racing real processes. Building the snapshot costs ~210ms (osascript title refresh + a scan of
+// every transcript); a session that registers and binds its socket inside that window is absent
+// from the snapshot, and if it is new enough to have no transcript yet it is absent from `known`
+// too — so it used to be swept while fully alive. Measured 2026-08-26 before the fix: socket
+// created at ~330ms, unlinked at ~345ms, in 4 of 12 simultaneous starts; 12 of 12 survived with
+// sweep() disabled. The victim stays unreachable for live signals until it restarts.
+// A brand-new REAL session also has no transcript, so this was a production race.
+const raceSid = `sid-snapshot-race-${RUN}`
+const sockOf = (sid) => join(ROOT, 'sock', `${encodeURIComponent(sid)}.sock`)
+writeFileSync(join(ROOT, 'sessions', `${encodeURIComponent(raceSid)}.json`), JSON.stringify({
+  sid: raceSid, label: 'mid-startup', pid: process.pid, tty: null, cwd: '/tmp',
+  started: new Date().toISOString(),
+}))
+writeFileSync(sockOf(raceSid), '')                      // stands in for the bound socket
+writeFileSync(inboxOf(raceSid), JSON.stringify({ id: `race-${RUN}`, ts: new Date().toISOString(), from: SID.a, to: raceSid, kind: 'msg', body: 'mail for a session that is mid-startup' }) + '\n')
+check('the race fixture is genuinely live by its own session file', isLiveSid(raceSid))
+check('and it is NOT in the transcript-derived known set', !knownSessionIds().has(raceSid))
+const sweptStale = sweep({ live: new Set() })           // inject the stale snapshot
+check('a live session\'s SOCKET survives a stale live snapshot', existsSync(sockOf(raceSid)),
+  sweptStale.join(','))
+check('a live session\'s INBOX survives a stale live snapshot', existsSync(inboxOf(raceSid)))
+check('nothing belonging to it was reported as removed',
+  !sweptStale.some((p) => p.includes(encodeURIComponent(raceSid))), sweptStale.join(','))
+// The same injected snapshot must still reclaim genuinely dead state, or the fix would have
+// disabled sweeping altogether.
+const deadSid = `sid-really-dead-${RUN}`
+writeFileSync(sockOf(deadSid), '')
+const sweptDead = sweep({ live: new Set() })
+check('a socket with no live session file IS still reclaimed', !existsSync(sockOf(deadSid)),
+  sweptDead.join(','))
+for (const f of [sockOf(raceSid), inboxOf(raceSid), join(ROOT, 'sessions', `${encodeURIComponent(raceSid)}.json`)]) {
+  try { unlinkSync(f) } catch {}
+}
 
 console.log('\n[8] channel is preferred when available, and verified afterwards')
 // The channel capability must always be declared, so an opted-in session can register us.
@@ -271,6 +347,47 @@ const inboxMode = statSync(join(BUS_ROOT, 'msgs', `${encodeURIComponent(hostileS
 check('bus root is 0700', dirMode === 0o700, `mode=${dirMode.toString(8)}`)
 check('inbox file is 0600', inboxMode === 0o600, `mode=${inboxMode.toString(8)}`)
 check('scrub keeps newlines and tabs', scrub('a\x1b[31mb\nc\td\x00') === 'ab\nc\td')
+const watchersMode = statSync(join(BUS_ROOT, 'watchers')).mode & 0o777
+check('watchers/ dir is 0700', watchersMode === 0o700, `mode=${watchersMode.toString(8)}`)
+armWatcher({ sid: SID.b, pid: process.pid, timeoutS: 60 })
+const wfMode = statSync(join(BUS_ROOT, 'watchers', `${encodeURIComponent(SID.b)}__${process.pid}.json`)).mode & 0o777
+check('a watcher registration file is 0600', wfMode === 0o600, `mode=${wfMode.toString(8)}`)
+disarmWatcher(SID.b, process.pid)
+
+console.log('\n[14] session_send and sessions_list disclose whether the target can act while idle')
+// A sender that cannot tell "delivered" from "delivered and nothing will notice" will report the
+// wrong thing to its human. That happened for real: a peer had stopped re-arming its watcher, the
+// send result read as reassurance, and the message was reported as received when it was not.
+{
+  // NOT armed: no watcher registered for B.
+  check('no watcher is registered for B yet', !watcherStatus(SID.b).armed)
+  const notArmed = await A.call('session_send', { to: SID.b, body: 'disclosure check, unarmed' })
+  check('send says NOT ARMED', /Idle pickup: NOT ARMED/.test(notArmed), notArmed)
+  check('send warns against reporting it as received',
+    /Do NOT report this as received or acted on/.test(notArmed), notArmed)
+  check('send still confirms durable storage', /stored durably and is never lost/.test(notArmed), notArmed)
+  check('sessions_list marks B as not armed',
+    /idle-pickup=NOT armed/.test(await A.call('sessions_list')))
+  await B.call('session_inbox')
+
+  // ARMED: register a watcher for B using this test process's own pid, which is alive.
+  armWatcher({ sid: SID.b, pid: process.pid, timeoutS: 900 })
+  const armed = await A.call('session_send', { to: SID.b, body: 'disclosure check, armed' })
+  check('send says ARMED', /Idle pickup: ARMED/.test(armed), armed)
+  check('send names the watcher pid', new RegExp(`watcher pid ${process.pid}`).test(armed), armed)
+  check('send says it can act without its human', /without its human/.test(armed), armed)
+  check('send does NOT carry the do-not-report warning when armed',
+    !/Do NOT report this as received/.test(armed), armed)
+  check('sessions_list marks B as armed', /idle-pickup=armed/.test(await A.call('sessions_list')))
+
+  // Redundant double-arm is disclosed, so duplicate wakes are attributable.
+  armWatcher({ sid: SID.b, pid: holders[0].pid, timeoutS: 900 })
+  const dbl = await A.call('session_send', { to: SID.b, body: 'disclosure check, double armed' })
+  check('send warns when more than one watcher is armed', /2 watchers are armed/.test(dbl), dbl)
+  disarmWatcher(SID.b, process.pid)
+  disarmWatcher(SID.b, holders[0].pid)
+  await B.call('session_inbox')
+}
 
 for (const p of [A, B, C]) p.kill()
 for (const h of holders) h.kill()
