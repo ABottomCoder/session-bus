@@ -3,12 +3,12 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import {
   sweep, knownSessionIds, unread, cleanLabel, register, listSessions, send, formatMessages,
   scrub, MAX_BODY, ROOT as BUS_ROOT, isLiveSid, armWatcher, disarmWatcher, watcherStatus,
-  signal, markArmPrompted,
+  signal, markArmPrompted, armPromptDue, clearArmPrompt,
 } from '../lib/bus.mjs'
 import { statSync } from 'node:fs'
 
@@ -296,12 +296,17 @@ const hookOut2 = execFileSync('node', [HOOK], {
 })
 check('hook silent when drained (no block loop)', hookOut2.trim() === '', JSON.stringify(hookOut2))
 
-console.log('\n[9b] Stop hook prompts a session to arm idle pickup — once, and only when it helps')
+console.log('\n[9b] Stop hook is a WATCHDOG for idle pickup — re-prompts while deaf, resets when armed')
 // Arming cannot be automated inside the plugin: the wake comes from Claude Code re-invoking the
 // model when a task IT launched exits, so the Bash tool must be the launcher and only the model can
-// call it. The hook is the enforcement point instead — it blocks the end of ONE turn to get the
+// call it. The hook is the enforcement point instead — it blocks the end of a turn to get the
 // watcher armed, after which the wake -> drain -> re-arm loop sustains itself. The human never has
 // to notice whether a session is armed.
+//
+// v0.10.0 prompted ONCE per session and then went silent forever. Measured 2026-08-27: all 9
+// business sessions on a 10-session bus had the latch set, 8 were unarmed and 6 were holding
+// unread mail. The loop breaks routinely, so a one-shot prompt means permanent deafness. These
+// checks pin the watchdog behaviour that replaced it.
 {
   const runHook = (sid) => {
     const out = execFileSync('node', [HOOK], {
@@ -311,6 +316,14 @@ console.log('\n[9b] Stop hook prompts a session to arm idle pickup — once, and
     })
     try { return JSON.parse(out) } catch { return out.trim() === '' ? null : out }
   }
+  const sessFile = (sid) => join(ROOT, 'sessions', `${encodeURIComponent(sid)}.json`)
+  const readSess = (sid) => JSON.parse(readFileSync(sessFile(sid), 'utf8'))
+  // Age the recorded prompt so the backoff for `n` prompts has provably elapsed, without sleeping.
+  const agePrompt = (sid, ms) => {
+    const v = readSess(sid)
+    v.armPrompt.at = new Date(Date.now() - ms).toISOString()
+    writeFileSync(sessFile(sid), JSON.stringify(v, null, 2))
+  }
 
   // A fresh session: live, no mail, not armed, never prompted, with A/B/C on the bus.
   const freshSid = `sid-armprompt-fresh-${RUN}`
@@ -318,19 +331,52 @@ console.log('\n[9b] Stop hook prompts a session to arm idle pickup — once, and
   register({ sid: freshSid, label: 'fresh-one', pid: holderF.pid, tty: null, cwd: '/tmp' })
   const first = runHook(freshSid)
   check('prompts when peers exist, nothing is armed and no channel', !!first?.decision, JSON.stringify(first).slice(0, 200))
-  const ctx = first?.hookSpecificOutput?.additionalContext || ''
-  check('the prompt names the peers that can message it', /other session\(s\) are on the bus/.test(ctx), ctx.slice(0, 200))
+  const ctx = first?.reason || ''
+  check('the prompt names the peers that can message it', /other\s*\n?session\(s\) can message it/.test(ctx), ctx.slice(0, 300))
   check('the prompt carries the runnable command with the right sid',
     ctx.includes(`bin/watch.mjs --sid ${freshSid}`), ctx.slice(0, 400))
   check('the prompt says to run it in the background', /run_in_background/.test(ctx))
   check('the prompt says it does not block the human', /does not block the human/.test(ctx))
-  check('the prompt states it appears once per session', /once per session/.test(ctx))
+  check('the prompt says reminders continue while unarmed', /reminded again/.test(ctx))
 
-  // Second call must be silent. The hook cannot arm the watcher itself, so without a latch it
-  // would block at the end of EVERY turn — the same non-convergence the mail path avoids by
-  // advancing the cursor before blocking.
-  check('does NOT prompt a second time (no nag loop)', runHook(freshSid) === null)
+  // The payload must be attached EXACTLY ONCE. An interactive session already renders a blocking
+  // Stop hook's `reason` twice; adding hookSpecificOutput.additionalContext made a third identical
+  // copy of the whole body, which for a 48k delivery batch tripled the cost of one delivery.
+  check('the payload is not duplicated into additionalContext',
+    first?.hookSpecificOutput?.additionalContext === undefined, JSON.stringify(first?.hookSpecificOutput))
+  check('the UI summary is short, not a restatement of the body',
+    (first?.hookSpecificOutput?.systemMessage || '').length < 120)
+  check('the body appears exactly once in the whole payload',
+    JSON.stringify(first).split('run_in_background').length - 1 === 1)
+
+  // Immediately after a prompt the backoff suppresses the next one, so the hook cannot block at the
+  // end of EVERY turn — the same non-convergence the mail path avoids by advancing the cursor first.
+  check('does NOT prompt again immediately (no nag loop)', runHook(freshSid) === null)
+  check('one prompt was recorded', readSess(freshSid).armPrompt?.n === 1)
+
+  // ...but it DOES come back once the backoff elapses. This is the whole fix: a session that never
+  // armed a watcher must not be left deaf for the rest of its life.
+  agePrompt(freshSid, 61_000)
+  check('DOES prompt again once the backoff elapses', !!runHook(freshSid)?.decision)
+  check('the prompt count advanced', readSess(freshSid).armPrompt?.n === 2)
+
+  // The interval widens, so a session that genuinely cannot arm one is not nagged every minute.
+  agePrompt(freshSid, 61_000)
+  check('the backoff widens after the second prompt', runHook(freshSid) === null)
+  agePrompt(freshSid, 181_000)
+  check('...and fires again at the wider interval', !!runHook(freshSid)?.decision)
   holderF.kill()
+
+  // A v0.10.0 session file carries the old boolean and no timestamp. It must read as DUE, or the
+  // sessions that are deaf right now would stay deaf until they restart.
+  const legacySid = `sid-armprompt-legacy-${RUN}`
+  const holderL = spawn('sleep', ['30'])
+  register({ sid: legacySid, label: 'legacy-one', pid: holderL.pid, tty: null, cwd: '/tmp' })
+  { const v = readSess(legacySid); v.armPrompted = true; writeFileSync(sessFile(legacySid), JSON.stringify(v, null, 2)) }
+  check('a v0.10.0 armPrompted=true session is due a prompt again', armPromptDue(legacySid))
+  check('and the hook actually prompts it', !!runHook(legacySid)?.decision)
+  check('the legacy boolean is dropped once migrated', readSess(legacySid).armPrompted === undefined)
+  holderL.kill()
 
   // Already armed -> nothing to fix, even in a fresh session that was never prompted.
   const armedSid = `sid-armprompt-armed-${RUN}`
@@ -340,6 +386,26 @@ console.log('\n[9b] Stop hook prompts a session to arm idle pickup — once, and
   check('does NOT prompt a session that is already armed', runHook(armedSid) === null)
   disarmWatcher(armedSid, process.pid)
   check('...and DOES prompt the same session once it is no longer armed', !!runHook(armedSid)?.decision)
+
+  // Being armed RESETS the backoff, so the next deaf episode is prompted at once instead of
+  // inheriting the previous episode's wait. Without this, a session that flapped between armed and
+  // deaf would drift into the 30-minute interval and effectively go quiet again.
+  check('the deaf episode recorded a prompt', readSess(armedSid).armPrompt?.n >= 1)
+  armWatcher({ sid: armedSid, pid: process.pid, timeoutS: 900 })
+  check('an armed session is still not prompted', runHook(armedSid) === null)
+  check('being armed cleared the backoff', readSess(armedSid).armPrompt === undefined)
+  disarmWatcher(armedSid, process.pid)
+  check('so the NEXT deaf episode is prompted immediately', !!runHook(armedSid)?.decision)
+
+  // The opt-out has to work, because the watchdog now speaks up repeatedly.
+  disarmWatcher(armedSid, process.pid)
+  clearArmPrompt(armedSid)
+  const outOut = execFileSync('node', [HOOK], {
+    encoding: 'utf8',
+    input: JSON.stringify({ session_id: armedSid, hook_event_name: 'Stop' }),
+    env: { ...process.env, SESSION_BUS_NO_CHANNEL: '1', SESSION_BUS_NO_ARM_PROMPT: '1' },
+  })
+  check('SESSION_BUS_NO_ARM_PROMPT=1 silences the watchdog', outOut.trim() === '', outOut.slice(0, 200))
   holderAP.kill()
 
   // Mail always wins: a session with unread mail gets the mail, not the arm prompt.
@@ -354,7 +420,7 @@ console.log('\n[9b] Stop hook prompts a session to arm idle pickup — once, and
     !/other session\(s\) are on the bus/.test(JSON.stringify(mailOut)))
   holderM.kill()
 
-  for (const sid of [freshSid, armedSid, mailSid]) {
+  for (const sid of [freshSid, armedSid, mailSid, legacySid]) {
     for (const [d, e] of [['msgs', '.jsonl'], ['cursors', '.json'], ['sessions', '.json'], ['sock', '.sock']]) {
       try { unlinkSync(join(ROOT, d, `${encodeURIComponent(sid)}${e}`)) } catch {}
     }

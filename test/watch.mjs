@@ -198,6 +198,14 @@ console.log('\n[W11] orderly outcomes stay exit 0 so they are not confused with 
   check('a real wake exits 0', woke.code === 0, `code=${woke.code}`)
   check('the two orderly outcomes are textually distinct',
     /no mail arrived/.test(expiry.out) && /unread message\(s\)/.test(woke.out))
+
+  // The expiry notice must tell the model to re-arm UNCONDITIONALLY. It used to say "if the user is
+  // still expecting a reply", which is false exactly overnight — nobody is expecting a reply at 3am,
+  // so a literal reading told the model to stay deaf until morning. Caught by a peer session
+  // reviewing the text, 2026-08-27.
+  check('the expiry notice tells the model to re-arm', /Re-arm this watcher now/.test(expiry.out), expiry.out)
+  check('and does NOT condition re-arming on someone waiting',
+    !/if the user is still expecting/.test(expiry.out), expiry.out)
 }
 
 console.log('\n[W12] armed state is observable to senders, and deregisters on every exit path')

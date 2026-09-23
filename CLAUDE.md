@@ -20,9 +20,9 @@ whichever fits its current state.*
 ## Quick Start
 
 ```bash
-node test/smoke.mjs                    # L1: 103 functional checks. Run this first.
+node test/smoke.mjs                    # L1: 119 functional checks. Run this first.
 node test/watch.mjs                    # L1: 69 checks for bin/watch.mjs (autonomous idle pickup)
-node test/stress.mjs                   # L2: 21 concurrency/race checks (multi-process)
+node test/stress.mjs                   # L2: 20 concurrency/race checks (multi-process)
 node test/chaos.mjs                    # L3: 30 fault-injection checks
 claude plugin validate .               # manifest check
 
@@ -58,8 +58,9 @@ bin/watch.mjs           Autonomous idle pickup where channels are unavailable. A
 mcp/server.mjs          MCP server, one instance per session. Hand-rolled JSON-RPC over
                         stdio (no SDK — that is what keeps dependencies at zero).
                         Exposes 4 tools; listens on the session's unix socket.
-hooks/stop-pickup.mjs   Stop hook. Delivers pending messages at the end of a turn, and — once per
-                        session, only where it helps — blocks one turn to get idle pickup armed.
+hooks/stop-pickup.mjs   Stop hook. Delivers pending messages at the end of a turn, and acts as the
+                        WATCHDOG for idle pickup: whenever the session is unarmed it blocks a turn
+                        to get a watcher armed, on a backoff that resets once armed.
 hooks/hooks.json        Declares the Stop hook to Claude Code.
 lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, rendering.
 .mcp.json               Declares the MCP server (uses ${CLAUDE_PLUGIN_ROOT}).
@@ -67,7 +68,7 @@ lib/bus.mjs             Everything shared: identity, inbox, signalling, sweep, r
 .gitignore              nothing is generated; this only guards against accidents.
 test/smoke.mjs          L1: 103 checks against real server processes, real JSON-RPC, real sockets.
 test/watch.mjs          L1: 69 checks for bin/watch.mjs — real child processes, real inboxes.
-test/stress.mjs         L2: 21 concurrency/race checks — real multi-process interleavings.
+test/stress.mjs         L2: 20 concurrency/race checks — real multi-process interleavings.
 test/chaos.mjs          L3: 30 fault-injection checks — corruption, floods, kills, garbage.
 ```
 
@@ -75,14 +76,27 @@ test/chaos.mjs          L3: 30 fault-injection checks — corruption, floods, ki
 
 | Layer | Evidence | Result |
 |---|---|---|
-| L1 business | smoke.mjs 103 checks (was 55; +3 empty-inbox reclamation, +6 stale-snapshot sweep race, +2 watcher-file permissions, +11 idle-pickup disclosure, +1 corrected wake-latency measurement, +14 that a fresh session is told how to arm idle pickup, +11 that the Stop hook gets it armed) | ✅ 103/103, and **stable**: repeated clean runs at load 4.5 where it previously failed ~50% |
+| L1 business | smoke.mjs 92 checks (was 55; +3 empty-inbox reclamation, +6 stale-snapshot sweep race, +2 watcher-file permissions, +11 idle-pickup disclosure, +1 corrected wake-latency measurement, +14 that a fresh session is told how to arm idle pickup, +11 that the Stop hook gets it armed) | ✅ 103/103, and **stable**: repeated clean runs at load 4.5 where it previously failed ~50% |
+| L1 business (2026-08-27, v0.12.0) | smoke.mjs 119 checks — [9b] grew 11 → 27 for the arm-prompt watchdog (re-prompt after backoff, widening interval, reset-on-armed, legacy-boolean migration, opt-out) and for invariant 12 (payload attached exactly once) | ⚠️ **118/119.** The one failure, `EMPTY inbox of a still-existing session is reclaimed` in [7], is **pre-existing and unrelated**: the untouched v0.10.0 cache copy fails the identical check on this machine (102/103). Not diagnosed — see Known failures |
 | L1 watcher | watch.mjs 69 checks (2026-08-26, v0.10.0): wake, already-pending early-out, burst coalescing, drain-during-settle must NOT wake, cursor untouched, socket untouched, body non-disclosure, kill reports deafness with non-zero exit, armed-state registration + deregistration on every exit path, SIGKILL reads as not-armed, sweep reclaims stale registrations, fs.watch-failure branch, per-pid registration with no mutual deregistration | ✅ 69/69 |
-| L2 concurrency | stress.mjs 21 checks; found+fixed a hot-path cursor rewrite that misread one appended record as a legacy file ([S6]), found+fixed cursor RMW race (96/200 lost), 500-id seen-cap resurrection, and [S7] a live session's socket being swept by another server's stale snapshot | ✅ 21/21 after fix |
+| L2 concurrency | stress.mjs 20 checks; found+fixed cursor RMW race (96/200 lost), 500-id seen-cap resurrection, and [S7] a live session's socket being swept by another server's stale snapshot | ✅ 20/20 after fix |
 | L3 fault/chaos | chaos.mjs 30 checks (+5 for corrupt/hostile watcher registrations); found+fixed newline-fusion append loss; flood batching + alert coalescing added after v0.5 review; SIGKILL recovery, floods, corruption all clean | ✅ 30/30 after fix |
 | L4 security | semgrep OSS important-only (p/javascript+nodejs+trailofbits+secrets): 0 findings; gitleaks full history: 0 leaks; zero deps → no CVE surface; hardening suite in smoke [13] | ✅ |
 | L5 observability | sessions_list reports true mode+reason (desktop, no channels); dead-socket send discloses WARNING + storage; live E2E: new sender × old cached receiver over channel path, autonomous ack in ~1s | ✅ |
 
 Node floor: everything above ran on Node v18.20.8 — the declared minimum is the tested version.
+
+### Known failures (open)
+
+| Check | Status |
+|---|---|
+| smoke [7] `EMPTY inbox of a still-existing session is reclaimed` | **Failing, pre-existing, not diagnosed.** Reproduced 2026-08-27 at 118/119. Established as pre-existing rather than a regression by running the *previous released version's* copy of the suite unchanged: it fails the identical check at 102/103. So it was introduced between the 2026-08-25 campaign and 2026-08-26, or it is environment-dependent. **Do not assume it is the sweep race** — that one is closed and separately pinned by [S7]. Reproduce it first, and per the lesson this file keeps recording, *instrument the resource rather than reasoning from the test text*. |
+| (same check, re-run 2026-09-23) | **Passed 119/119** on macOS / Node 24.14.1 with an idle bus (no sessions registered) while assembling v0.12.0. Points at environment-dependent rather than deterministic; still not diagnosed. |
+
+Technique worth reusing: this repo has no git history, so the **installed plugin cache holds the only
+pristine copy of the previous version** (see Gotchas for the layout). Running that copy's suite
+answers "did I break this?" in one command. Keep the old version's cache directory until a change is
+signed off.
 
 ### RESOLVED: the smoke [3]/[4] flakiness was a real production race (2026-08-26, v0.10.0)
 
@@ -326,27 +340,218 @@ bookkeeping: it would watch the inbox and wake nobody. So the Bash tool must be 
 only the model can call it.
 
 **So the Stop hook is the enforcement point.** It already runs at the end of every turn and already
-injects context. When there is no mail to deliver it now blocks **one** turn with the runnable arm
-command. After that the wake → drain → re-arm loop sustains itself and the hook stays quiet.
+injects context. When there is no mail to deliver it blocks a turn with the runnable arm command, so
+the wake → drain → re-arm loop gets started without the human noticing anything.
 
 Gated deliberately, because a background process per session is not free:
 
 | Gate | Why |
 |---|---|
+| `SESSION_BUS_NO_ARM_PROMPT` unset | an explicit opt-out, since the watchdog speaks up repeatedly |
+| not currently armed | including a watcher armed by an earlier turn |
+| backoff elapsed | **the hook cannot arm the watcher, so it cannot clear its own condition** |
 | channels unavailable | with channels there is nothing to fix |
-| not already armed | including a watcher armed by an earlier turn |
 | at least one live peer | alone on the bus, nobody can message this session |
-| not already prompted | **the hook cannot arm the watcher, so it cannot clear its own condition** |
 
-That last gate is the important one. Without a latch the hook would block at the end of *every* turn
-— the same non-convergence the mail path avoids by advancing the cursor before blocking. The latch is
-`armPrompted` in the session's own registration file: writable under invariant 2, reset naturally by
-a restart, no extra directory, and written atomically because `listSessions()` drops any session whose
-file will not parse.
+Checks run cheapest-first: `watcherStatus` is one `readdir` and `armPromptDue` one `readJson`, while
+`channelStatus` shells out to `ps` and `listSessions` costs ~210ms.
+
+#### The prompt is a WATCHDOG, not a one-shot — v0.10.0's latch caused permanent deafness
+
+v0.10.0 rate-limited the prompt with a once-per-session boolean (`armPrompted`). It converged, and it
+**never recovered**: after that single prompt the hook went quiet for the rest of the session's life,
+whether or not a watcher was ever armed.
+
+The wake → drain → re-arm loop does *not* reliably sustain itself. It breaks routinely:
+
+- the human presses ESC, and the harness tears the background task down with SIGTERM;
+- the 1800s deadline is reached, the model reports "nothing arrived" and does not re-arm;
+- the model decides its task is finished and stops re-arming;
+- the model simply doesn't notice a non-zero exit.
+
+Each of those left the session deaf, with nothing left in the system to say so.
+
+**Measured 2026-08-27 on a live 10-session bus:** `armPrompted=true` on all 9 business sessions —
+every one prompted exactly once — with **8 of them not armed and 6 of those holding unread mail**
+(10 stranded messages). The latch was the mechanism keeping them deaf.
+
+So the latch became a **backoff that resets when the session is observed armed** (`armPrompt: {at, n}`
+in the session's own registration file — writable under invariant 2, no extra directory, written
+atomically because `listSessions()` drops any session whose file will not parse):
+
+| Prompts already sent | Wait before the next one |
+|---|---|
+| 0 (never prompted) | immediate |
+| 1 | 60s |
+| 2 | 180s |
+| 3 | 600s |
+| 4+ | 1800s |
+
+Two properties make this both convergent and recovering:
+
+1. **The interval widens**, so a session that genuinely cannot arm a watcher (Bash denied, human
+   declined) is nagged at 1/3/10/30 minutes rather than at the end of every turn.
+2. **Being armed clears the counter**, so the prompt costs one turn per deaf *episode* rather than one
+   per session, and a session that flaps between armed and deaf does not drift into the 30-minute
+   interval and effectively go quiet again.
+
+Because every watcher wake is itself a turn, the hook re-checks right after each wake — which is what
+makes the loop self-healing instead of dependent on the model remembering to re-arm.
+
+A v0.10.0 session file (old boolean, no timestamp) reads as **due immediately**, so sessions that are
+already deaf recover on their next turn instead of waiting for a restart. `register()` deliberately
+does not carry the state across a server start, for the same reason: a restarted session should be
+prompted promptly.
+
+Pinned by smoke [9b] (27 checks): re-prompt after the backoff elapses, the widening interval, the
+reset-on-armed, the legacy-boolean migration, and the opt-out.
 
 Mail always outranks the prompt, and `bin/bus.mjs list` reports `idle-pickup=armed|NOT-armed` per
 session so a human can answer "is it listening?" from any terminal instead of asking the session.
 Pinned by smoke [9b] (11 checks, including the no-nag-loop case and mail-outranks-prompt).
+
+#### Overnight autonomy: the recovery chain, measured end to end (2026-08-27)
+
+The requirement that forced the watchdog: **sessions must keep receiving peer mail overnight with no
+human present.** Nobody is getting up at 3am to nudge a session.
+
+The chain that has to close, unattended:
+
+```
+watcher stops (mail wake / clean expiry / death)
+  -> the harness re-invokes the model, because a background task exited
+  -> that turn ends -> Stop hook runs -> sees unarmed -> watchdog prompts -> model re-arms
+```
+
+Every link was measured, by **two independent instruments**: the watched session's own watcher stdout,
+and a sampler in a different session polling `watchers/` every 5s that knew nothing about its turns.
+
+| Link | Result |
+|---|---|
+| A turn that ends unarmed gets prompted at the Stop boundary | ✅ 1 copy, label `Stop hook feedback:`, text contains `reminded again` |
+| Mail wake → re-arm | ✅ 5 unattended `NONE` → armed transitions, latency 5s to 2m31s |
+| Clean expiry (exit 0) → re-arm | ✅ 3 of 3 at `--timeout-s 120`, all genuine expiries confirmed from watcher stdout |
+| **SIGKILL** (uncatchable, no cleanup, no self-report) → re-arm | ✅ killed 19:19:08 → unarmed 19:19:10 → **re-armed 19:19:35** (~27s), zero human input |
+
+The load-bearing measurement is the **deliberate negative**: on the third expiry the watched session
+ended its turn *without* re-arming, specifically so the watchdog had to be the thing that recovered it.
+It fired. Without that case the result would only have shown that the model happened to remember —
+which is exactly what a guarantee must not depend on.
+
+SIGKILL closing is the important one for overnight, because it means the harness tracks a background
+task by **process lifetime, not exit status**. Any process death produces a wake, therefore a turn.
+
+**Two paths, and it matters which one fires.** In the SIGKILL case the wake arrived as a *harness task
+notification* (`<status>failed</status>`, `exit code 137` = 128+9) in ~12s, and the model re-armed from
+that alone — **the Stop hook was never needed**. So the ordering is:
+
+1. **Primary:** the background task exits → harness task notification → model re-arms.
+2. **Backup:** if the model doesn't re-arm, the Stop hook watchdog catches it at the turn boundary.
+
+Both were observed firing. Don't describe the watchdog as *the* mechanism; it is the net under it, and
+the deliberate-negative expiry is the proof the net works.
+
+**Be careful not to over-credit the watchdog, because path 1 is a HARNESS feature and predates it.**
+Task-completion notification on background-task exit is Claude Code behaviour, identical in v0.10.0.
+Measured on a v0.10.0 session the same evening: its watcher expired at ~1800s and it was re-armed
+within ~30s, notification-driven, with no human input in the window. So **v0.10.0 was never
+deaf-by-default on a clean expiry**, and the changelog must not imply the watchdog is what makes
+expiry recovery work.
+
+What v0.10.0 actually lacked is the net: **any turn that ends unarmed for some other reason.** The
+model was woken but chose not to re-arm; it judged its task finished; an interrupt killed the watcher
+and no re-arm followed; the re-arm itself failed. In every one of those the latch guaranteed nothing
+would ever ask again.
+
+And that is not a rare edge — it is the dominant real-world failure. The 2026-08-27 census found
+`armPrompted=true` on all 9 sessions with **8 unarmed and 6 holding stranded mail**, on a version
+where path 1 was fully functional. The notification mechanism alone does not keep a fleet reachable,
+because it depends on the woken model deciding to re-arm every single time. The watchdog removes that
+dependence, which is the whole value.
+
+Useful diagnostic: an **abnormal death is distinguishable from a clean expiry by stdout alone**, not
+just by exit code. A clean expiry always carries the three-line advisory (`no mail arrived …`,
+`Nothing arrived …`, `Re-arm this watcher now …`); a SIGKILLed watcher carries *nothing* but
+`[exited with code 137]`.
+
+⚠️ **Still unmeasured, and it is the actual 3am case: harness-level loss.** Laptop sleep or suspend,
+a Claude Code restart or crash, an OS reboot, or the tasks directory going away. In all of those the
+**notifier dies with the watcher**, so neither path above applies: no live process, no task
+notification, and no turn — so the Stop hook cannot run either. The ~12s recovery measured above is
+evidence about *process* death with the harness held constant; it says nothing about harness loss.
+
+And this class is **not auto-recoverable by design**, which is worth stating plainly so nobody builds
+the wrong fix. An external observer (a `launchd` job or cron polling `watchers/`) can *detect* an
+unarmed session, but it cannot restore one. So external monitoring buys visibility and an alert, never
+recovery. Since the deaf exposure scales directly with `--timeout-s`, a multi-hour default is only
+defensible once harness loss is ruled out or externally covered.
+
+**Be precise about WHY, because the wrong reason invites a dangerous workaround.** The limit is not a
+permission boundary and not an inability to launch the process: a `launchd` job can run
+`node bin/watch.mjs` perfectly well, and that process will watch the inbox and detect mail correctly.
+The limit is **harness task ownership** — model re-invocation happens only when a background task *the
+harness itself launched via the Bash tool* exits. An externally-spawned watcher's exit is an event
+nobody is listening for.
+
+> ⚠️ **Never spawn `bin/watch.mjs` from outside the session it belongs to** (launchd, cron, a wrapper
+> script, another session's Bash). It is worse than leaving the session unarmed. `armWatcher()` runs
+> unconditionally once `watchInbox()` succeeds (`bin/watch.mjs:119`), so the orphan **registers itself in
+> `watchers/` as armed** — and `sessions_list` and `session_send` will then tell every peer the target
+> can act on mail unprompted, when nothing will re-invoke it. That is precisely the false-availability
+> failure the `watchers/` registry was introduced to eliminate. The mail itself is safe (the watcher
+> never calls `markSeen` — verified, and pinned by [W9]), so nothing is consumed or lost; what breaks is
+> that senders are told a deaf session is listening.
+
+The practical mitigation for an unattended night on a laptop is therefore to stop the machine sleeping
+in the first place (`caffeinate -dimsu`), not to shorten the window. A session cannot measure any of
+this from inside — a suspend or restart takes the observer with it — so it needs a process outside
+Claude Code entirely, or a human-driven sleep/wake with a third session watching.
+
+Also confirmed behaving as designed: SIGKILL leaves the watcher's registration file behind (it cannot
+clean up), and `watcherStatus()` still reads it as **not armed** because liveness is by pid. `sweep()`
+reclaims the file at the next server start.
+
+**Method worth reusing.** Resolve the target pid from `watchers/` with a live `kill -0` check **at kill
+time**. An earlier draft of this test reused a previously-observed pid — which was already dead, because
+the very message setting the test up had woken that watcher and made it exit cleanly. Killing a stale
+pid would have recorded "silent death, never recovered" and argued for a liveness check the real
+measurement shows is unnecessary. Generalised: *an instruction to "hold still and do nothing" is only a
+valid control if the thing being measured still exists when the measuring starts.*
+
+#### Choosing `--timeout-s`: a long window is strictly BETTER, not a compromise
+
+The intuition that a short window keeps a session "more responsive" is wrong, and it is worth stating
+plainly because it inverts the obvious reading of the flag.
+
+**Mail wakes the watcher immediately regardless of how much of the window remains.** `--timeout-s`
+governs one thing only: how often you pay for a **no-op expiry**. So expiry frequency is *pure
+overhead* — it buys no responsiveness at all.
+
+And a no-op expiry is not cheap. Each one re-invokes the model, and **each re-invocation re-reads the
+session's entire conversation context**; the model's own output length is irrelevant to the cost. Worse,
+any wake more than ~5 minutes after the last one falls outside the prompt-cache TTL, so essentially
+every expiry is a **cache miss**. Rough shape of it over an 8-hour unattended night, per session:
+
+| Window | No-op wakes / night | All cache misses |
+|---|---|---|
+| 90s | ~320 | yes |
+| 1800s (current default) | ~16 | yes |
+| 8h | ~1 | yes |
+
+The practical rules that follow:
+
+- **Prefer the longest window you are confident the harness will honour.** The only reason the default
+  is 1800s is that background-task lifetime is verified only to ~1800s (see the table above); it is a
+  limit of the evidence, not a design preference.
+- **Never shorten the window to "check more often".** It cannot improve mail latency, and it multiplies
+  cost linearly.
+- **To test the re-arm loop, use a short window for a BOUNDED count** (e.g. 3 expiries, then stop and
+  report) rather than an open-ended short-window loop. You learn the same thing for a twentieth of the
+  spend. Asking a peer session to cycle a 90s window indefinitely is the expensive way to learn
+  something a 3-cycle run establishes.
+
+Credit where due: this was caught by a peer session pushing back on a test design of exactly that
+shape, 2026-08-27, rather than by the author.
 
 Operational notes:
 
@@ -468,6 +673,34 @@ prevent.
 11. **Declaring the `claude/channel` capability must stay unconditional.** It is what lets an
    opted-in session register us, and it is harmless where channels don't work — the server
    still serves tools normally (verified on Bedrock).
+12. **The Stop hook attaches its payload to the top-level `reason` ONLY — never also to
+   `hookSpecificOutput.additionalContext`, and never a second copy in `hookSpecificOutput.reason`.**
+   v0.10.0 set all three. Measured in a real interactive session on 2026-08-27, one arm prompt
+   landed in context **three times, verbatim**, under three different labels:
+   `Stop hook feedback:`, `Stop hook blocking error from command ...:`, and
+   `Stop hook additional context:`. For a full 48k `deliveryBatch` that tripled the context cost
+   of a single delivery — the exact resource the batching cap exists to protect.
+
+   Which field actually carries it was pinned by a `claude -p --output-format stream-json` probe:
+   **`reason` alone reaches the model** (1 copy, as a user-role `Stop hook feedback` message),
+   while `additionalContext` and `hookSpecificOutput.reason` contributed **nothing**, and
+   `systemMessage` produced only a generic `Stop hook error occurred · ctrl+o to see` UI line.
+   So `reason` is load-bearing and must stay; the other two were pure duplication.
+
+   **Result, measured in a real interactive session on v0.12.0: 3 copies → 1.** A second session
+   running the fix reported the arm prompt exactly once, framed only by `Stop hook feedback:`,
+   with neither of the other two labels present anywhere.
+
+   ⚠️ One thing is measured but NOT explained: dropping `additionalContext` and
+   `hookSpecificOutput.reason` also removed the `Stop hook blocking error from command ...:` copy,
+   even though `decision: 'block'` is unchanged. The working guess is that carrying a top-level
+   `reason` **and** a `hookSpecificOutput.reason` is what made the harness render the block as an
+   error as well. That is a guess — do not rely on it. What is established is the field mapping
+   above and the 3 → 1 outcome.
+
+   All output goes through the single `emit()` helper, so the payload cannot be attached twice by
+   accident and both callers (mail delivery and the arm prompt) share one shape. Pinned by smoke
+   [9b] ("the body appears exactly once in the whole payload").
 
 ## Trust model (hardened 2026-08-25, v0.4.0)
 
@@ -596,6 +829,7 @@ loosening the regex.
 | `SESSION_BUS_NO_CHANNEL=1` | Never use the channel path |
 | `SESSION_BUS_CHANNEL_VERIFY_MS` | Push verification window, default 25000 |
 | `SESSION_BUS_ALERT_COOLDOWN_MS` | Notification re-alert cooldown while unread mail keeps arriving, default 300000 |
+| `SESSION_BUS_NO_ARM_PROMPT=1` | Never prompt this session to arm idle pickup (the Stop hook watchdog stays silent) |
 | `SESSION_BUS_SID` / `SESSION_BUS_PID` | Test-only identity overrides |
 
 ## Platform notes

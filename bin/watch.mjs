@@ -118,11 +118,18 @@ const watcher = watchInbox(sid, onChange)
 // outcome worse than not being armed at all.
 if (watcher) armWatcher({ sid, pid: process.pid, timeoutS })
 
+// The re-arm instruction is deliberately UNCONDITIONAL. It used to read "Re-arm this watcher if the
+// user is still expecting a reply", which is false in exactly the case that matters: overnight,
+// nobody is expecting a reply, so a model reading it literally has been told NOT to re-arm — and the
+// session goes deaf for the rest of the night. The Stop-hook watchdog would still recover it, but
+// then the watcher's own advice is fighting the hook that overrides it. Caught by a peer session
+// reviewing this text, 2026-08-27. Reachability is not conditional on anyone waiting.
 const deadline = setTimeout(() => {
   finish([
     `SESSION-BUS: no mail arrived for session ${shortId(sid)} within ${timeoutS}s.`,
     'Nothing arrived. Do not invent a result and do not claim a peer replied.',
-    'Re-arm this watcher if the user is still expecting a reply.',
+    'Re-arm this watcher now to stay reachable. Do NOT make that conditional on whether anyone is',
+    'waiting for a reply — an unarmed session cannot be reached at all while it is idle.',
   ].join('\n'))
 }, timeoutS * 1000)
 
